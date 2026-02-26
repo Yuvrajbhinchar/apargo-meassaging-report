@@ -1,3 +1,41 @@
 spring:
   application:
     name: message_report
+
+  datasource:
+    url: jdbc:mysql://localhost:3306/apargo_wa_messaging?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+    username: root
+    password: yuvraj@3933
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      minimum-idle: 5
+      maximum-pool-size: 20
+      idle-timeout: 300000
+      connection-timeout: 20000
+
+  jpa:
+    hibernate:
+      # CRITICAL: 'validate' — Hibernate checks schema but never alters it.
+      # Use 'none' if you manage schema via Flyway/Liquibase.
+      # NEVER use 'create' or 'update' in production.
+      ddl-auto: validate
+    show-sql: false
+    open-in-view: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.MySQLDialect
+        format_sql: true
+        # Batch inserts for broadcast recipients
+        jdbc:
+          batch_size: 50
+        order_inserts: true
+        order_updates: true
+
+server:
+  port: 8080
+
+logging:
+  level:
+    com.apargo.services.message_report: INFO
+    org.hibernate.SQL: DEBUG          # set to INFO in prod
+    org.hibernate.type.descriptor: TRACE  # comment out in prod
