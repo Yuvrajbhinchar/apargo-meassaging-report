@@ -78,10 +78,6 @@ public class Message {
     @Column(name = "body_text", columnDefinition = "TEXT")
     private String bodyText;
 
-    // ── New column (added via ALTER TABLE) ────────────────────────────────
-    @Column(name = "caption", columnDefinition = "TEXT")
-    private String caption;
-
     @Column(name = "media_asset_id")
     private Long mediaAssetId;
 
@@ -89,17 +85,10 @@ public class Message {
     @Column(name = "payload", columnDefinition = "JSON")
     private String payload;
 
-    // ── New column (added via ALTER TABLE) ────────────────────────────────
-    @JdbcTypeCode(SqlTypes.JSON)
-    @Column(name = "response", columnDefinition = "JSON")
-    private String response;
 
     @Column(name = "provider_message_id", length = 150)
     private String providerMessageId;
 
-    // ── New column (added via ALTER TABLE) ────────────────────────────────
-    @Column(name = "reply_to_provider_id", length = 150)
-    private String replyToProviderId;
 
     @Enumerated(EnumType.STRING)
     @Column(name = "status",

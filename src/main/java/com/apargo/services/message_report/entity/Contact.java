@@ -39,8 +39,8 @@ public class Contact {
     @Column(name = "display_name", length = 150)
     private String displayName;
 
-    @Enumerated(EnumType.STRING)          // explicit — never rely on default
-    @Column(name = "source")
+    @Enumerated(EnumType.ORDINAL)
+    @Column(name = "source", columnDefinition = "tinyint")
     private Source source;
 
     @Column(name = "first_seen_at")
