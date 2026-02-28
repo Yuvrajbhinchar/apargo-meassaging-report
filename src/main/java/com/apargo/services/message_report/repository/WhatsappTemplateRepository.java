@@ -13,15 +13,19 @@ import java.util.Optional;
  * Read-only access to apargo_wa_template.whatsapp_templates.
  *
  * Two load strategies:
- *  1. findByProjectAndNameAndLanguage  – single template (used when rendering one message)
- *  2. findAllByProjectAndNamesAndLanguages – batch load for a full conversation page (avoids N+1)
+ *  1. findWithComponentsByProjectAndNameAndLanguage – single template
+ *  2. findBatchByProjectAndNames – all templates for a conversation page (no N+1)
+ *
+ * NOTE on ORDER BY:
+ *  Hibernate 6 throws "Could not generate fetch" when ORDER BY is combined
+ *  with multiple collection JOIN FETCHes on a DISTINCT query.
+ *  Ordering is handled at the collection level via @OrderBy on the entity
+ *  relationships (componentOrder ASC, buttonIndex ASC) — no ORDER BY needed here.
  */
 @Repository
 public interface WhatsappTemplateRepository extends JpaRepository<WhatsappTemplate, Long> {
 
     // ── Single template with full component tree ──────────────────────────
-    // EntityGraph eager-loads: components → buttons + carouselCards → cardComponents → buttons
-    // This replaces lazy-load chains and keeps it to 1 round-trip.
     @Query("""
         SELECT DISTINCT t FROM WhatsappTemplate t
         LEFT JOIN FETCH t.components c
@@ -33,7 +37,6 @@ public interface WhatsappTemplateRepository extends JpaRepository<WhatsappTempla
           AND t.name        = :name
           AND t.language    = :language
           AND t.deletedAt  IS NULL
-        ORDER BY t.id ASC
         """)
     Optional<WhatsappTemplate> findWithComponentsByProjectAndNameAndLanguage(
             @Param("projectId") Long projectId,
@@ -41,9 +44,15 @@ public interface WhatsappTemplateRepository extends JpaRepository<WhatsappTempla
             @Param("language")  String language
     );
 
-    // ── Batch: all templates for a set of (name, language) pairs ─────────
-    // Used to pre-load every template referenced in a conversation page in one query.
-    // Caller filters by projectId + (name, language) combinations from the message list.
+    // ── Batch: all templates for a set of names on a conversation page ────
+    //
+    // ORDER BY t.id ASC intentionally REMOVED.
+    // Reason: Hibernate 6 cannot generate a valid fetch join when ORDER BY
+    // is present alongside multiple collection JOIN FETCHes in a DISTINCT query.
+    // It throws: "Could not generate fetch: WhatsappTemplate(t) -> components"
+    //
+    // Component ordering is preserved by @OrderBy("componentOrder ASC") on
+    // WhatsappTemplate.components, and @OrderBy("buttonIndex ASC") on buttons.
     @Query("""
         SELECT DISTINCT t FROM WhatsappTemplate t
         LEFT JOIN FETCH t.components c
@@ -54,7 +63,6 @@ public interface WhatsappTemplateRepository extends JpaRepository<WhatsappTempla
         WHERE t.projectId = :projectId
           AND t.name      IN :names
           AND t.deletedAt IS NULL
-        ORDER BY t.id ASC
         """)
     List<WhatsappTemplate> findBatchByProjectAndNames(
             @Param("projectId") Long projectId,
