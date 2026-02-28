@@ -17,37 +17,37 @@ public interface MessageRepository extends JpaRepository<Message, Long> {
 
     // ══════════════════════════════════════════════════════════════════════
     //  CONVERSATION DETAIL — keyset cursor (created_at DESC, id DESC)
-    //  Shows newest messages first; frontend scrolls up to load older.
+    //  Newest messages first; frontend scrolls up to load older pages.
     //  Hits idx_conversation_time (conversation_id, created_at) directly.
+    //
+    //  Selected fields map exactly to columns in apargo_report.messages
+    //  — no added or renamed columns required.
     // ══════════════════════════════════════════════════════════════════════
 
-    /**
-     * FIRST PAGE — no cursor, returns newest messages.
-     */
+    /** FIRST PAGE — no cursor. */
     @Query("""
         SELECT
-            m.id                  AS messageId,
-            m.uuid                AS uuid,
-            m.direction           AS direction,
-            m.messageType         AS messageType,
-            m.status              AS status,
-            m.bodyText            AS bodyText,
-            m.caption             AS caption,
-            m.templateName        AS templateName,
-            m.templateLanguage    AS templateLanguage,
-            m.mediaAssetId        AS mediaAssetId,
-            m.providerMessageId   AS providerMessageId,
-            m.replyToProviderId   AS replyToProviderId,
-            m.createdByType       AS createdByType,
-            m.createdById         AS createdById,
-            m.createdAt           AS createdAt,
-            m.sentAt              AS sentAt,
-            m.deliveredAt         AS deliveredAt,
-            m.readAt              AS readAt,
-            msr.isSent            AS isSent,
-            msr.isDelivered       AS isDelivered,
-            msr.isRead            AS isRead,
-            msr.isFailed          AS isFailed
+            m.id                AS messageId,
+            m.uuid              AS uuid,
+            m.direction         AS direction,
+            m.messageType       AS messageType,
+            m.status            AS status,
+            m.bodyText          AS bodyText,
+            m.templateName      AS templateName,
+            m.templateLanguage  AS templateLanguage,
+            m.templateVars      AS templateVars,
+            m.mediaAssetId      AS mediaAssetId,
+            m.providerMessageId AS providerMessageId,
+            m.createdByType     AS createdByType,
+            m.createdById       AS createdById,
+            m.createdAt         AS createdAt,
+            m.sentAt            AS sentAt,
+            m.deliveredAt       AS deliveredAt,
+            m.readAt            AS readAt,
+            msr.isSent          AS isSent,
+            msr.isDelivered     AS isDelivered,
+            msr.isRead          AS isRead,
+            msr.isFailed        AS isFailed
         FROM Message m
         LEFT JOIN MessageStatusRollup msr ON msr.messageId = m.id
         WHERE m.conversation.id = :conversationId
@@ -58,34 +58,30 @@ public interface MessageRepository extends JpaRepository<Message, Long> {
             Pageable pageable
     );
 
-    /**
-     * NEXT PAGES — cursor carries (createdAt, messageId) from last row.
-     * Keyset avoids OFFSET scan — O(1) depth-independent.
-     */
+    /** NEXT PAGES — keyset cursor. O(1) regardless of depth. */
     @Query("""
         SELECT
-            m.id                  AS messageId,
-            m.uuid                AS uuid,
-            m.direction           AS direction,
-            m.messageType         AS messageType,
-            m.status              AS status,
-            m.bodyText            AS bodyText,
-            m.caption             AS caption,
-            m.templateName        AS templateName,
-            m.templateLanguage    AS templateLanguage,
-            m.mediaAssetId        AS mediaAssetId,
-            m.providerMessageId   AS providerMessageId,
-            m.replyToProviderId   AS replyToProviderId,
-            m.createdByType       AS createdByType,
-            m.createdById         AS createdById,
-            m.createdAt           AS createdAt,
-            m.sentAt              AS sentAt,
-            m.deliveredAt         AS deliveredAt,
-            m.readAt              AS readAt,
-            msr.isSent            AS isSent,
-            msr.isDelivered       AS isDelivered,
-            msr.isRead            AS isRead,
-            msr.isFailed          AS isFailed
+            m.id                AS messageId,
+            m.uuid              AS uuid,
+            m.direction         AS direction,
+            m.messageType       AS messageType,
+            m.status            AS status,
+            m.bodyText          AS bodyText,
+            m.templateName      AS templateName,
+            m.templateLanguage  AS templateLanguage,
+            m.templateVars      AS templateVars,
+            m.mediaAssetId      AS mediaAssetId,
+            m.providerMessageId AS providerMessageId,
+            m.createdByType     AS createdByType,
+            m.createdById       AS createdById,
+            m.createdAt         AS createdAt,
+            m.sentAt            AS sentAt,
+            m.deliveredAt       AS deliveredAt,
+            m.readAt            AS readAt,
+            msr.isSent          AS isSent,
+            msr.isDelivered     AS isDelivered,
+            msr.isRead          AS isRead,
+            msr.isFailed        AS isFailed
         FROM Message m
         LEFT JOIN MessageStatusRollup msr ON msr.messageId = m.id
         WHERE m.conversation.id = :conversationId
@@ -100,21 +96,14 @@ public interface MessageRepository extends JpaRepository<Message, Long> {
             Pageable pageable
     );
 
-    /**
-     * Count total messages in a conversation — for first-page total.
-     */
+    /** Total message count — used for first-page badge only. */
     @Query("SELECT COUNT(m.id) FROM Message m WHERE m.conversation.id = :conversationId")
     long countByConversationId(@Param("conversationId") Long conversationId);
 
     // ══════════════════════════════════════════════════════════════════════
-    //  MARK AS READ — reset unread counter on conversation
-    //  Called when agent opens / views a conversation.
+    //  MARK AS READ — single UPDATE, no entity load
     // ══════════════════════════════════════════════════════════════════════
 
-    /**
-     * Zero out the unread counter for the conversation in a single UPDATE.
-     * No entity load needed — avoids dirty-checking overhead.
-     */
     @Modifying
     @Query("""
         UPDATE Conversation c

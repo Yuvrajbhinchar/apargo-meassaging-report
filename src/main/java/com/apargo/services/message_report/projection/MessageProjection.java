@@ -10,6 +10,7 @@ import java.time.Instant;
 /**
  * JPQL projection for the conversation message list.
  * Joins messages + message_status_rollup in one query — no N+1, no lazy issues.
+ * Fields are strictly limited to columns that exist in apargo_report.messages.
  */
 public interface MessageProjection {
 
@@ -22,14 +23,14 @@ public interface MessageProjection {
 
     // ── Content ───────────────────────────────────────────────────────────
     String           getBodyText();
-    String           getCaption();
     String           getTemplateName();
     String           getTemplateLanguage();
+    /** templateVars JSON — used to substitute {{1}}, {{2}} placeholders in template bubbles */
+    String           getTemplateVars();
     Long             getMediaAssetId();
 
     // ── Provider ──────────────────────────────────────────────────────────
     String           getProviderMessageId();
-    String           getReplyToProviderId();
 
     // ── Authorship ────────────────────────────────────────────────────────
     CreatedByType    getCreatedByType();

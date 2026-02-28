@@ -21,20 +21,21 @@ public class ChatMessageResponse {
     private final String           uuid;
 
     // ── Direction & type ──────────────────────────────────────────────────
-    private final MessageDirection direction;      // INBOUND | OUTBOUND
-    private final MessageType      messageType;    // TEXT, IMAGE, TEMPLATE …
+    private final MessageDirection direction;
+    private final MessageType      messageType;
     private final MessageStatus    status;
 
     // ── Content ───────────────────────────────────────────────────────────
     private final String           bodyText;
-    private final String           caption;
     private final String           templateName;
     private final String           templateLanguage;
-    private final Long             mediaAssetId;  // resolve URL in frontend if needed
+    private final Long             mediaAssetId;
 
-    // ── Threading ─────────────────────────────────────────────────────────
+    // ── Template detail (only for TEMPLATE-type messages) ─────────────────
+    private final TemplateDetailResponse templateDetail;
+
+    // ── Provider ──────────────────────────────────────────────────────────
     private final String           providerMessageId;
-    private final String           replyToProviderId;   // null if not a reply
 
     // ── Authorship ────────────────────────────────────────────────────────
     private final CreatedByType    createdByType;
@@ -59,12 +60,10 @@ public class ChatMessageResponse {
                 .messageType(p.getMessageType())
                 .status(p.getStatus())
                 .bodyText(p.getBodyText())
-                .caption(p.getCaption())
                 .templateName(p.getTemplateName())
                 .templateLanguage(p.getTemplateLanguage())
                 .mediaAssetId(p.getMediaAssetId())
                 .providerMessageId(p.getProviderMessageId())
-                .replyToProviderId(p.getReplyToProviderId())
                 .createdByType(p.getCreatedByType())
                 .createdById(p.getCreatedById())
                 .createdAt(p.getCreatedAt())
@@ -77,6 +76,30 @@ public class ChatMessageResponse {
                         .isRead(Boolean.TRUE.equals(p.getIsRead()))
                         .isFailed(Boolean.TRUE.equals(p.getIsFailed()))
                         .build())
+                .build();
+    }
+
+    /** Returns a copy with templateDetail attached (called by ChatService after enrichment). */
+    public ChatMessageResponse withTemplateDetail(TemplateDetailResponse detail) {
+        return ChatMessageResponse.builder()
+                .messageId(messageId)
+                .uuid(uuid)
+                .direction(direction)
+                .messageType(messageType)
+                .status(status)
+                .bodyText(bodyText)
+                .templateName(templateName)
+                .templateLanguage(templateLanguage)
+                .mediaAssetId(mediaAssetId)
+                .templateDetail(detail)
+                .providerMessageId(providerMessageId)
+                .createdByType(createdByType)
+                .createdById(createdById)
+                .createdAt(createdAt)
+                .sentAt(sentAt)
+                .deliveredAt(deliveredAt)
+                .readAt(readAt)
+                .ticks(ticks)
                 .build();
     }
 }
