@@ -22,10 +22,10 @@ import java.util.*;
  *   Run → Edit Configurations → Program Arguments → --seed
  *
  *   OR run from terminal:
- *   mvn spring-boot:run -Dspring-boot.run.arguments=--seed
+ *   mvn spring-boot:run "-Dspring-boot.run.arguments=--seed"
  *
  *   For quick smoke test (50k messages):
- *   mvn spring-boot:run -Dspring-boot.run.arguments="--seed --quick"
+ *   mvn spring-boot:run "-Dspring-boot.run.arguments=--seed --quick"
  *
  * It will exit automatically when done.
  */
@@ -63,7 +63,6 @@ public class DataSeeder implements CommandLineRunner {
     private static final String[] STATUSES       = {"OPEN","OPEN","OPEN","CLOSED","ARCHIVED"};
     private static final String[] ASSIGNED_TYPES = {"UNASSIGNED","USER","USER","TEAM"};
     private static final String[] DIRECTIONS     = {"INBOUND","OUTBOUND"};
-    private static final String[] MSG_TYPES      = {"TEXT","TEXT","TEXT","IMAGE","DOCUMENT","TEMPLATE","TEMPLATE"};
     private static final String[] MSG_STATUSES   = {"SENT","DELIVERED","READ","READ","FAILED"};
     private static final String[] BY_TYPES       = {"USER","USER","SYSTEM","AUTOMATION","CAMPAIGN"};
     private static final String[] TEMPLATE_NAMES = {
@@ -80,6 +79,13 @@ public class DataSeeder implements CommandLineRunner {
             "Confirm","Update","Status","Issue","Help","Support"
     };
 
+    /**
+     * Dynamically loaded from DB at runtime.
+     * Weighted so TEXT appears ~3x and TEMPLATE ~2x more than others.
+     * Falls back to {"TEXT"} if detection fails.
+     */
+    private String[] MSG_TYPES;
+
     private final Random rng = new Random();
 
     // ─────────────────────────────────────────────────────────────────────
@@ -93,15 +99,18 @@ public class DataSeeder implements CommandLineRunner {
             return;
         }
 
+        // ── Detect valid ENUM values from DB before any seeding ──────────
+        initEnumValues();
+
         boolean quick = argList.contains("--quick");
         int numMessages = quick ? NUM_MESSAGES_QUICK : NUM_MESSAGES_FULL;
 
         log.info("╔══════════════════════════════════════════════════╗");
         log.info("║        Apargo DB Seeder — Starting               ║");
         log.info("║  Mode     : {}                         ", quick ? "QUICK (50k)" : "FULL  (2M) ");
-        log.info("║  Contacts : {:,}                              ", NUM_CONTACTS);
-        log.info("║  Convs    : {:,}                             ", NUM_CONVERSATIONS);
-        log.info("║  Messages : {:,}                          ", numMessages);
+        log.info("║  Contacts : {}                              ", NUM_CONTACTS);
+        log.info("║  Convs    : {}                             ", NUM_CONVERSATIONS);
+        log.info("║  Messages : {}                          ", numMessages);
         log.info("╚══════════════════════════════════════════════════╝");
 
         long totalStart = System.currentTimeMillis();
@@ -122,6 +131,72 @@ public class DataSeeder implements CommandLineRunner {
         // Exit after seeding — don't keep the server running
         SpringApplication.exit(ctx, () -> 0);
         System.exit(0);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    //  INIT — detect valid message_type ENUM values from DB
+    //
+    //  Why dynamic?
+    //   ddl-auto: validate only checks column *kind* (string-like), NOT the
+    //   exact set of ENUM literals. So Hibernate boots fine even when the DB
+    //   ENUM is a subset of what the entity declares. Inserting a value not in
+    //   the DB ENUM causes "Data truncated for column 'message_type'".
+    //   Reading the actual ENUM definition at startup makes the seeder
+    //   self-healing regardless of schema state.
+    // ══════════════════════════════════════════════════════════════════════
+
+    private void initEnumValues() {
+        try {
+            String enumDef = jdbc.queryForObject(
+                    "SELECT COLUMN_TYPE " +
+                            "FROM information_schema.COLUMNS " +
+                            "WHERE TABLE_SCHEMA = DATABASE() " +
+                            "  AND TABLE_NAME   = 'messages' " +
+                            "  AND COLUMN_NAME  = 'message_type'",
+                    String.class
+            );
+
+            // enumDef looks like: enum('TEXT','IMAGE','VIDEO',...)
+            if (enumDef != null && enumDef.toLowerCase().startsWith("enum(")) {
+                String inner = enumDef.substring(5, enumDef.length() - 1); // strip enum( and )
+                Set<String> valid = new LinkedHashSet<>();
+                for (String token : inner.split(",")) {
+                    valid.add(token.replace("'", "").trim().toUpperCase());
+                }
+
+                log.info("  Detected message_type ENUM values from DB: {}", valid);
+
+                // Build a weighted list — prefer TEXT (3x) and TEMPLATE (2x)
+                // so the seeded data feels realistic; only include values the DB actually supports
+                List<String> weighted = new ArrayList<>();
+                String[] preferred = {"TEXT", "TEXT", "TEXT", "TEMPLATE", "TEMPLATE",
+                        "IMAGE", "DOCUMENT", "AUDIO", "VIDEO", "INTERACTIVE",
+                        "REACTION", "SYSTEM"};
+
+                for (String v : preferred) {
+                    if (valid.contains(v)) {
+                        weighted.add(v);
+                    }
+                }
+
+                if (weighted.isEmpty()) {
+                    // Last resort: use whatever the DB has
+                    weighted.addAll(valid);
+                }
+
+                MSG_TYPES = weighted.toArray(new String[0]);
+                log.info("  MSG_TYPES weight pool: {}", Arrays.toString(MSG_TYPES));
+
+            } else {
+                log.warn("  Unexpected COLUMN_TYPE value '{}', falling back to TEXT only", enumDef);
+                MSG_TYPES = new String[]{"TEXT"};
+            }
+
+        } catch (Exception e) {
+            log.warn("  Could not detect message_type ENUM from DB ({}). " +
+                    "Falling back to TEXT only.", e.getMessage());
+            MSG_TYPES = new String[]{"TEXT"};
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -310,7 +385,8 @@ public class DataSeeder implements CommandLineRunner {
         // Load contact_id per conv (need it for messages.contact_id)
         Map<Long, Long> convContactMap = new HashMap<>();
         jdbc.query("SELECT id, contact_id FROM conversations",
-                (RowCallbackHandler) rs -> convContactMap.put(rs.getLong("id"), rs.getLong("contact_id")));
+                (RowCallbackHandler) rs -> convContactMap.put(
+                        rs.getLong("id"), rs.getLong("contact_id")));
 
         String msgSql = """
             INSERT INTO messages
@@ -343,7 +419,7 @@ public class DataSeeder implements CommandLineRunner {
         for (int i = 0; i < numMessages; i++) {
             long convId    = pick(convIds);
             long contactId = convContactMap.getOrDefault(convId, 1L);
-            String msgType  = pick(MSG_TYPES);
+            String msgType  = pick(MSG_TYPES);   // ← uses dynamically loaded valid values
             String direction= pick(DIRECTIONS);
             String status   = pick(MSG_STATUSES);
             String byType   = pick(BY_TYPES);
@@ -378,7 +454,7 @@ public class DataSeeder implements CommandLineRunner {
             lastMsgPerConv.put(convId, (long) i); // temp; updated after insert
 
             if (msgBatch.size() >= BATCH_SIZE) {
-                flushMessageBatch(msgBatch, rollupBatch, msgSql, rollupSql, lastMsgPerConv, convIds);
+                flushMessageBatch(msgBatch, rollupBatch, msgSql, rollupSql, lastMsgPerConv);
                 done += msgBatch.size();
                 msgBatch.clear();
                 rollupBatch.clear();
@@ -388,7 +464,7 @@ public class DataSeeder implements CommandLineRunner {
 
         // Final batch
         if (!msgBatch.isEmpty()) {
-            flushMessageBatch(msgBatch, rollupBatch, msgSql, rollupSql, lastMsgPerConv, convIds);
+            flushMessageBatch(msgBatch, rollupBatch, msgSql, rollupSql, lastMsgPerConv);
             done += msgBatch.size();
         }
 
@@ -403,15 +479,13 @@ public class DataSeeder implements CommandLineRunner {
             List<Object[]> msgBatch,
             List<Object[]> rollupBatch,
             String msgSql, String rollupSql,
-            Map<Long, Long> lastMsgPerConv,
-            List<Long> convIds
+            Map<Long, Long> lastMsgPerConv
     ) {
         // Insert messages
         jdbc.batchUpdate(msgSql, msgBatch);
 
         // Get the last inserted ID range
-        Long maxId = jdbc.queryForObject(
-                "SELECT MAX(id) FROM messages", Long.class);
+        Long maxId = jdbc.queryForObject("SELECT MAX(id) FROM messages", Long.class);
 
         if (maxId == null) return;
 
