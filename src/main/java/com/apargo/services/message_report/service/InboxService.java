@@ -4,6 +4,7 @@ import com.apargo.services.message_report.dto.request.InboxFilterRequest;
 import com.apargo.services.message_report.dto.response.CursorPageResponse;
 import com.apargo.services.message_report.dto.response.CursorUtil;
 import com.apargo.services.message_report.dto.response.InboxItemResponse;
+import com.apargo.services.message_report.enums.AssignedType;
 import com.apargo.services.message_report.enums.ConversationStatus;
 import com.apargo.services.message_report.projection.InboxProjection;
 import com.apargo.services.message_report.repository.ConversationRepository;
@@ -26,103 +27,102 @@ public class InboxService {
     private final ConversationRepository conversationRepo;
 
     // ══════════════════════════════════════════════════════════════════════
-    //  INBOX  — open conversations only (status = OPEN)
+    //  INBOX  — open conversations only (status forced to OPEN)
     // ══════════════════════════════════════════════════════════════════════
 
     public CursorPageResponse<InboxItemResponse> getInbox(InboxFilterRequest req) {
-        // Force status = OPEN for inbox
         req.setStatus(ConversationStatus.OPEN);
         return fetchPage(req);
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    //  MESSAGE HISTORY — all conversations, no status filter by default
+    //  MESSAGE HISTORY — all conversations; status optional filter
     // ══════════════════════════════════════════════════════════════════════
 
     public CursorPageResponse<InboxItemResponse> getMessageHistory(InboxFilterRequest req) {
-        // status stays null unless caller explicitly filters (closed, archived, etc.)
+        // status stays null (= all) unless caller passes e.g. ?status=CLOSED
         return fetchPage(req);
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    //  SHARED CORE — both APIs use the same query, differ only in filters
+    //  SHARED CORE
     // ══════════════════════════════════════════════════════════════════════
 
     private CursorPageResponse<InboxItemResponse> fetchPage(InboxFilterRequest req) {
 
         int size = Math.min(req.getSize(), MAX_PAGE_SIZE);
 
-        // We fetch size+1 rows — if we get more than size back, there's a next page
+        // Fetch size+1 to detect next page without a separate COUNT query on scroll
         Pageable limit = PageRequest.of(0, size + 1);
 
         boolean unreadOnly    = Boolean.TRUE.equals(req.getUnreadOnly());
         boolean activeSession = Boolean.TRUE.equals(req.getActiveSession());
 
-        // Null-safe filter params (JPQL treats null as "no filter")
-        Object statusParam       = req.getStatus();       // enum or null
-        Object assignedTypeParam = req.getAssignedType(); // enum or null
-        String searchParam       = blankToNull(req.getSearch());
+        // Typed enums — Hibernate resolves bind type correctly even when null
+        ConversationStatus status       = req.getStatus();        // null = no filter
+        AssignedType       assignedType = req.getAssignedType();  // null = no filter
+        String             search       = blankToNull(req.getSearch());
 
         List<InboxProjection> rows;
 
         if (req.getCursor() == null) {
-            // ── First page ──────────────────────────────────────────────
+            // ── First page ───────────────────────────────────────────────
             rows = conversationRepo.findFirstPage(
                     req.getProjectId(),
-                    statusParam,
-                    assignedTypeParam,
+                    status,
+                    assignedType,
                     req.getAssignedId(),
                     unreadOnly,
                     activeSession,
-                    searchParam,
+                    search,
                     limit
             );
         } else {
             // ── Subsequent pages ─────────────────────────────────────────
-            long[] parts     = CursorUtil.decode(req.getCursor());
+            long[]  parts      = CursorUtil.decode(req.getCursor());
             Instant cursorTime = Instant.ofEpochMilli(parts[0]);
             long    cursorId   = parts[1];
 
             rows = conversationRepo.findNextPage(
                     req.getProjectId(),
-                    statusParam,
-                    assignedTypeParam,
+                    status,
+                    assignedType,
                     req.getAssignedId(),
                     unreadOnly,
                     activeSession,
-                    searchParam,
+                    search,
                     cursorTime,
                     cursorId,
                     limit
             );
         }
 
-        // ── Determine if there are more pages ─────────────────────────────
+        // ── Detect next page via probe row ────────────────────────────────
         boolean hasMore = rows.size() > size;
-        if (hasMore) rows = rows.subList(0, size); // trim the extra probe row
+        if (hasMore) rows = rows.subList(0, size);
 
-        // ── Build next cursor from last row ───────────────────────────────
+        // ── Build cursor from last row ────────────────────────────────────
         String nextCursor = null;
         if (hasMore) {
             InboxProjection last = rows.get(rows.size() - 1);
             nextCursor = CursorUtil.encode(last.getLastMessageAt(), last.getConversationId());
         }
 
-        // ── Get total count (only on first page to avoid repeated COUNT queries) ──
-        long totalCount = 0;
+        // ── totalCount only on first page (avoid repeated COUNT on every scroll) ──
+        // Returns Long (boxed) — null on page 2+ so @JsonInclude(NON_NULL) omits it
+        Long totalCount = null;
         if (req.getCursor() == null) {
             totalCount = conversationRepo.countFiltered(
                     req.getProjectId(),
-                    statusParam,
-                    assignedTypeParam,
+                    status,
+                    assignedType,
                     req.getAssignedId(),
                     unreadOnly,
                     activeSession,
-                    searchParam
+                    search
             );
         }
 
-        // ── Map projections → response DTOs ──────────────────────────────
         List<InboxItemResponse> data = rows.stream()
                 .map(InboxItemResponse::from)
                 .toList();
@@ -130,7 +130,7 @@ public class InboxService {
         return CursorPageResponse.<InboxItemResponse>builder()
                 .data(data)
                 .pageSize(data.size())
-                .totalCount(totalCount)
+                .totalCount(totalCount)   // null on page 2+ → omitted from JSON
                 .nextCursor(nextCursor)
                 .hasMore(hasMore)
                 .build();

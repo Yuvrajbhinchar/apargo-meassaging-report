@@ -1,22 +1,21 @@
 package com.apargo.services.message_report.entity;
 
-
 import java.time.Instant;
 
 import com.apargo.services.message_report.enums.AssignedType;
 import com.apargo.services.message_report.enums.ConversationStatus;
 import com.apargo.services.message_report.enums.MessageDirection;
 import jakarta.persistence.*;
-import jakarta.persistence.PrePersist;
-import jakarta.persistence.PreUpdate;
 import lombok.Data;
+import org.hibernate.annotations.CreationTimestamp;
+import org.hibernate.annotations.UpdateTimestamp;
 
 @Data
 @Entity
 @Table(name = "conversations", indexes = {
-        @Index(name = "idx_inbox", columnList = "project_id,waba_account_id,last_message_at"),
+        @Index(name = "idx_inbox",    columnList = "project_id,waba_account_id,last_message_at"),
         @Index(name = "idx_assigned", columnList = "project_id,assigned_type,assigned_id,last_message_at"),
-        @Index(name = "idx_contact", columnList = "contact_id")
+        @Index(name = "idx_contact",  columnList = "contact_id")
 })
 public class Conversation {
 
@@ -36,12 +35,13 @@ public class Conversation {
     @Column(name = "contact_id", nullable = false)
     private Long contactId;
 
+    // ── columnDefinition MUST match DB exactly (UPPERCASE) ───────────────
     @Enumerated(EnumType.STRING)
-    @Column(name = "status", columnDefinition = "ENUM('open','closed','archived','blocked')")
+    @Column(name = "status", columnDefinition = "ENUM('OPEN','CLOSED','ARCHIVED','BLOCKED')")
     private ConversationStatus status = ConversationStatus.OPEN;
 
     @Enumerated(EnumType.STRING)
-    @Column(name = "assigned_type", columnDefinition = "ENUM('unassigned','user','team')")
+    @Column(name = "assigned_type", columnDefinition = "ENUM('UNASSIGNED','USER','TEAM')")
     private AssignedType assignedType = AssignedType.UNASSIGNED;
 
     @Column(name = "assigned_id")
@@ -57,7 +57,7 @@ public class Conversation {
     private Instant lastMessageAt;
 
     @Enumerated(EnumType.STRING)
-    @Column(name = "last_message_direction", columnDefinition = "ENUM('inbound','outbound')")
+    @Column(name = "last_message_direction", columnDefinition = "ENUM('INBOUND','OUTBOUND')")
     private MessageDirection lastMessageDirection;
 
     @Column(name = "last_message_preview", length = 300)
@@ -78,26 +78,11 @@ public class Conversation {
     @Column(name = "is_locked", columnDefinition = "TINYINT(1) DEFAULT 0")
     private Boolean isLocked = false;
 
+    @CreationTimestamp
     @Column(name = "created_at", updatable = false)
     private Instant createdAt;
 
+    @UpdateTimestamp
     @Column(name = "updated_at")
     private Instant updatedAt;
-
-    @PrePersist
-    protected void onCreate() {
-        createdAt = Instant.now();
-        updatedAt = Instant.now();
-    }
-
-    @PreUpdate
-    protected void onUpdate() {
-        updatedAt = Instant.now();
-    }
-
-
-
-
-
-
 }

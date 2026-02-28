@@ -4,41 +4,24 @@ import com.apargo.services.message_report.enums.CreatedByType;
 import com.apargo.services.message_report.enums.MessageDirection;
 import com.apargo.services.message_report.enums.MessageStatus;
 import com.apargo.services.message_report.enums.MessageType;
-import jakarta.persistence.Entity;
+import jakarta.persistence.*;
 import lombok.Data;
-
-import jakarta.persistence.CascadeType;
-import jakarta.persistence.Column;
-import jakarta.persistence.EnumType;
-import jakarta.persistence.Enumerated;
-import jakarta.persistence.FetchType;
-import jakarta.persistence.GeneratedValue;
-import jakarta.persistence.GenerationType;
-import jakarta.persistence.Id;
-import jakarta.persistence.Index;
-import jakarta.persistence.JoinColumn;
-import jakarta.persistence.ManyToOne;
-import jakarta.persistence.OneToMany;
-import jakarta.persistence.OneToOne;
-import jakarta.persistence.PrePersist;
-import jakarta.persistence.Table;
-import jakarta.persistence.ForeignKey;
 
 import java.time.Instant;
 import java.util.List;
 
+import org.hibernate.annotations.CreationTimestamp;
 import org.hibernate.annotations.JdbcTypeCode;
 import org.hibernate.type.SqlTypes;
-
 
 @Data
 @Entity
 @Table(name = "messages", indexes = {
         @Index(name = "idx_conversation_time", columnList = "conversation_id,created_at"),
-        @Index(name = "idx_project_time", columnList = "project_id,created_at"),
-        @Index(name = "idx_contact_time", columnList = "contact_id,created_at"),
-        @Index(name = "idx_provider_msg", columnList = "provider_message_id"),
-        @Index(name = "idx_campaign", columnList = "campaign_id")
+        @Index(name = "idx_project_time",      columnList = "project_id,created_at"),
+        @Index(name = "idx_contact_time",      columnList = "contact_id,created_at"),
+        @Index(name = "idx_provider_msg",      columnList = "provider_message_id"),
+        @Index(name = "idx_campaign",          columnList = "campaign_id")
 })
 public class Message {
 
@@ -56,7 +39,8 @@ public class Message {
     private Long projectId;
 
     @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "conversation_id", nullable = false, foreignKey = @ForeignKey(name = "fk_message_conversation"))
+    @JoinColumn(name = "conversation_id", nullable = false,
+            foreignKey = @ForeignKey(name = "fk_message_conversation"))
     private Conversation conversation;
 
     @Column(name = "waba_account_id", nullable = false)
@@ -69,12 +53,16 @@ public class Message {
     @JoinColumn(name = "campaign_id", foreignKey = @ForeignKey(name = "fk_message_campaign"))
     private BroadcastCampaign campaign;
 
+    // ── columnDefinition values MUST match DB EXACTLY (UPPERCASE) ────────
+
     @Enumerated(EnumType.STRING)
-    @Column(name = "direction", nullable = false, columnDefinition = "ENUM('inbound','outbound')")
+    @Column(name = "direction", nullable = false,
+            columnDefinition = "ENUM('INBOUND','OUTBOUND')")
     private MessageDirection direction;
 
     @Enumerated(EnumType.STRING)
-    @Column(name = "message_type", nullable = false, columnDefinition = "ENUM('text','image','video','audio','document','template','interactive','reaction','system')")
+    @Column(name = "message_type", nullable = false,
+            columnDefinition = "ENUM('TEXT','IMAGE','VIDEO','AUDIO','DOCUMENT','TEMPLATE','INTERACTIVE','REACTION','SYSTEM')")
     private MessageType messageType;
 
     @Column(name = "template_name", length = 200)
@@ -90,6 +78,10 @@ public class Message {
     @Column(name = "body_text", columnDefinition = "TEXT")
     private String bodyText;
 
+    // ── New column (added via ALTER TABLE) ────────────────────────────────
+    @Column(name = "caption", columnDefinition = "TEXT")
+    private String caption;
+
     @Column(name = "media_asset_id")
     private Long mediaAssetId;
 
@@ -97,11 +89,21 @@ public class Message {
     @Column(name = "payload", columnDefinition = "JSON")
     private String payload;
 
+    // ── New column (added via ALTER TABLE) ────────────────────────────────
+    @JdbcTypeCode(SqlTypes.JSON)
+    @Column(name = "response", columnDefinition = "JSON")
+    private String response;
+
     @Column(name = "provider_message_id", length = 150)
     private String providerMessageId;
 
+    // ── New column (added via ALTER TABLE) ────────────────────────────────
+    @Column(name = "reply_to_provider_id", length = 150)
+    private String replyToProviderId;
+
     @Enumerated(EnumType.STRING)
-    @Column(name = "status", columnDefinition = "ENUM('queued','processing','sent','delivered','read','failed','rejected','expired')")
+    @Column(name = "status",
+            columnDefinition = "ENUM('QUEUED','PROCESSING','SENT','DELIVERED','READ','FAILED','REJECTED','EXPIRED')")
     private MessageStatus status = MessageStatus.QUEUED;
 
     @Column(name = "error_code", length = 40)
@@ -111,12 +113,14 @@ public class Message {
     private String errorMessage;
 
     @Enumerated(EnumType.STRING)
-    @Column(name = "created_by_type", columnDefinition = "ENUM('user','system','automation','campaign')")
+    @Column(name = "created_by_type",
+            columnDefinition = "ENUM('USER','SYSTEM','AUTOMATION','CAMPAIGN')")
     private CreatedByType createdByType = CreatedByType.USER;
 
     @Column(name = "created_by_id")
     private Long createdById;
 
+    @CreationTimestamp
     @Column(name = "created_at", updatable = false)
     private Instant createdAt;
 
@@ -129,7 +133,8 @@ public class Message {
     @Column(name = "read_at")
     private Instant readAt;
 
-    // Relationships
+    // ── Relationships ─────────────────────────────────────────────────────
+
     @OneToMany(mappedBy = "message", cascade = CascadeType.ALL)
     private List<MessageStatusEvent> statusEvents;
 
@@ -138,9 +143,4 @@ public class Message {
 
     @OneToMany(mappedBy = "message")
     private List<BroadcastRecipient> broadcastRecipients;
-
-    @PrePersist
-    protected void onCreate() {
-        createdAt = Instant.now();
-    }
 }

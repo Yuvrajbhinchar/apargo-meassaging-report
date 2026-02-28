@@ -1,31 +1,36 @@
 package com.apargo.services.message_report.entity;
 
-
 import jakarta.persistence.*;
 import lombok.Getter;
-import lombok.Setter;
-import org.hibernate.annotations.CreationTimestamp;
-import org.hibernate.annotations.UpdateTimestamp;
+import org.hibernate.annotations.Immutable;
 
 import java.time.LocalDateTime;
 
-@Entity
-@Table(
-        name = "contacts"
-)
+/**
+ * READ-ONLY mirror of the contacts service table.
+ *
+ * @Immutable  → Hibernate NEVER issues INSERT / UPDATE / DELETE for this entity.
+ *               Any accidental save() call throws immediately.
+ *               Also skips dirty-checking → faster flush cycle.
+ *
+ * No @GeneratedValue → this service never inserts contacts.
+ * No @CreationTimestamp / @UpdateTimestamp → those only make sense on owned entities.
+ */
 @Getter
-@Setter
+@Immutable
+@Entity
+@Table(name = "contacts")
 public class Contact {
 
     @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
-    @Column(name = "id", nullable = false)
+    // NO @GeneratedValue — we are READING existing contacts, never inserting
+    @Column(name = "id")
     private Long id;
 
-    @Column(name = "organization_id", nullable = false)
+    @Column(name = "organization_id")
     private Long organizationId;
 
-    @Column(name = "wa_phone_e164", nullable = false, length = 20)
+    @Column(name = "wa_phone_e164", length = 20)
     private String waPhoneE164;
 
     @Column(name = "wa_id", length = 64)
@@ -34,29 +39,26 @@ public class Contact {
     @Column(name = "display_name", length = 150)
     private String displayName;
 
-    // UPDATED: Use custom converter
-    @Column(name = "source", nullable = false)
-    private Source source = Source.MANUAL;
+    @Enumerated(EnumType.STRING)          // explicit — never rely on default
+    @Column(name = "source")
+    private Source source;
 
-    @Column(name = "first_seen_at", nullable = false)
-    private LocalDateTime firstSeenAt = LocalDateTime.now();
+    @Column(name = "first_seen_at")
+    private LocalDateTime firstSeenAt;
 
     @Column(name = "last_seen_at")
     private LocalDateTime lastSeenAt;
 
-    @CreationTimestamp
-    @Column(name = "created_at", nullable = false, updatable = false)
+    @Column(name = "created_at")
     private LocalDateTime createdAt;
 
-    @UpdateTimestamp
-    @Column(name = "updated_at", nullable = false)
+    @Column(name = "updated_at")
     private LocalDateTime updatedAt;
 
-    // -------- ENUM (UPDATED: IMPORT instead of import_) --------
     public enum Source {
-        MANUAL,      // → "manual" in DB
-        IMPORT,      // → "import" in DB (this was the problem!)
-        INTEGRATION, // → "integration" in DB
-        INBOUND      // → "inbound" in DB
+        MANUAL,
+        IMPORT,
+        INTEGRATION,
+        INBOUND
     }
 }

@@ -2,54 +2,55 @@ package com.apargo.services.message_report.entity;
 
 import jakarta.persistence.*;
 import lombok.Getter;
-import lombok.Setter;
-import org.hibernate.annotations.CreationTimestamp;
-import org.hibernate.annotations.UpdateTimestamp;
+import org.hibernate.annotations.Immutable;
 
 import java.time.LocalDateTime;
 
+/**
+ * READ-ONLY mirror of the contacts service project_contacts table.
+ * Not used by Inbox or Message History APIs currently.
+ * Retained for future Contact Detail / Right Panel API.
+ *
+ * @Immutable prevents accidental INSERT/UPDATE/DELETE from this service.
+ */
+@Getter
+@Immutable
 @Entity
 @Table(
         name = "project_contacts",
         uniqueConstraints = {
-                @UniqueConstraint(
-                        name = "uk_project_contact",
-                        columnNames = {"project_id", "contact_id"}
-                )
+                @UniqueConstraint(name = "uk_project_contact",
+                        columnNames = {"project_id", "contact_id"})
         }
 )
-@Getter
-@Setter
 public class ProjectContact {
 
     @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
-    @Column(name = "id", nullable = false)
+    // No @GeneratedValue — this service never inserts project_contacts
+    @Column(name = "id")
     private Long id;
 
-    @Column(name = "project_id", nullable = false)
+    @Column(name = "project_id")
     private Long projectId;
 
-    @Column(name = "contact_id", nullable = false)
+    @Column(name = "contact_id")
     private Long contactId;
 
     @Column(name = "conversation_id")
     private Long conversationId;
 
-    @Column(name = "last_message_at", nullable = false)
+    @Column(name = "last_message_at")
     private LocalDateTime lastMessageAt;
 
     @Column(name = "last_message_id")
     private Long lastMessageId;
 
-    @Column(name = "unread_count", nullable = false)
-    private Integer unreadCount = 0;
+    @Column(name = "unread_count")
+    private Integer unreadCount;
 
-    @CreationTimestamp
-    @Column(name = "created_at", nullable = false, updatable = false)
+    @Column(name = "created_at")
     private LocalDateTime createdAt;
 
-    @UpdateTimestamp
-    @Column(name = "updated_at", nullable = false)
+    @Column(name = "updated_at")
     private LocalDateTime updatedAt;
 }
