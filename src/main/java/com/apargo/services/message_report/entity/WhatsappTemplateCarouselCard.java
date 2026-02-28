@@ -2,6 +2,7 @@ package com.apargo.services.message_report.entity;
 
 import jakarta.persistence.*;
 import lombok.Getter;
+import org.hibernate.annotations.BatchSize;
 import org.hibernate.annotations.Immutable;
 
 import java.time.Instant;
@@ -32,6 +33,7 @@ public class WhatsappTemplateCarouselCard {
     private Instant createdAt;
 
     // ── Card sub-components (HEADER / BODY / BUTTONS) ─────────────────────
+    @BatchSize(size = 50)
     @OneToMany(mappedBy = "card", fetch = FetchType.LAZY)
     @OrderBy("id ASC")
     private List<WhatsappTemplateCarouselCardComponent> cardComponents = new ArrayList<>();

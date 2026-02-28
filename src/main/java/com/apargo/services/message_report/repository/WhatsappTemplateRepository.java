@@ -25,45 +25,36 @@ import java.util.Optional;
 @Repository
 public interface WhatsappTemplateRepository extends JpaRepository<WhatsappTemplate, Long> {
 
-    // ── Single template with full component tree ──────────────────────────
     @Query("""
-        SELECT DISTINCT t FROM WhatsappTemplate t
-        LEFT JOIN FETCH t.components c
-        LEFT JOIN FETCH c.buttons
-        LEFT JOIN FETCH c.carouselCards cc
-        LEFT JOIN FETCH cc.cardComponents ccc
-        LEFT JOIN FETCH ccc.buttons
-        WHERE t.projectId   = :projectId
-          AND t.name        = :name
-          AND t.language    = :language
-          AND t.deletedAt  IS NULL
-        """)
+    SELECT t FROM WhatsappTemplate t
+    WHERE t.projectId  = :projectId
+      AND t.name       = :name
+      AND t.language   = :language
+      AND t.deletedAt IS NULL
+    """)
     Optional<WhatsappTemplate> findWithComponentsByProjectAndNameAndLanguage(
             @Param("projectId") Long projectId,
             @Param("name")      String name,
             @Param("language")  String language
     );
-
-    // ── Batch: all templates for a set of names on a conversation page ────
-    //
-    // ORDER BY t.id ASC intentionally REMOVED.
-    // Reason: Hibernate 6 cannot generate a valid fetch join when ORDER BY
-    // is present alongside multiple collection JOIN FETCHes in a DISTINCT query.
-    // It throws: "Could not generate fetch: WhatsappTemplate(t) -> components"
-    //
-    // Component ordering is preserved by @OrderBy("componentOrder ASC") on
-    // WhatsappTemplate.components, and @OrderBy("buttonIndex ASC") on buttons.
+    /**
+     * Batch load templates for a set of names.
+     *
+     * JOIN FETCH is intentionally REMOVED for the batch query.
+     * Reason: Hibernate 6 throws "Could not generate fetch" when DISTINCT +
+     * multiple @OneToMany JOIN FETCHes + @OrderBy are combined.
+     *
+     * Collections are loaded via @BatchSize on the entity fields instead,
+     * which issues one SQL per collection level (not one per row).
+     * Force-initialization happens inside TemplateLoaderService (REQUIRES_NEW
+     * transaction) so collections are safe to access after the transaction ends.
+     */
     @Query("""
-        SELECT DISTINCT t FROM WhatsappTemplate t
-        LEFT JOIN FETCH t.components c
-        LEFT JOIN FETCH c.buttons
-        LEFT JOIN FETCH c.carouselCards cc
-        LEFT JOIN FETCH cc.cardComponents ccc
-        LEFT JOIN FETCH ccc.buttons
-        WHERE t.projectId = :projectId
-          AND t.name      IN :names
-          AND t.deletedAt IS NULL
-        """)
+    SELECT t FROM WhatsappTemplate t
+    WHERE t.projectId = :projectId
+      AND t.name      IN :names
+      AND t.deletedAt IS NULL
+    """)
     List<WhatsappTemplate> findBatchByProjectAndNames(
             @Param("projectId") Long projectId,
             @Param("names")     List<String> names

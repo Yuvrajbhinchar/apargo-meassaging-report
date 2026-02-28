@@ -2,6 +2,7 @@ package com.apargo.services.message_report.entity;
 
 import jakarta.persistence.*;
 import lombok.Getter;
+import org.hibernate.annotations.BatchSize;
 import org.hibernate.annotations.Immutable;
 
 import java.time.Instant;
@@ -53,6 +54,7 @@ public class WhatsappTemplateCarouselCardComponent {
     private Instant createdAt;
 
     // ── Buttons (only present when componentType == BUTTONS) ──────────────
+    @BatchSize(size = 50)
     @OneToMany(mappedBy = "cardComponent", fetch = FetchType.LAZY)
     @OrderBy("buttonIndex ASC")
     private List<WhatsappTemplateCarouselButton> buttons = new ArrayList<>();

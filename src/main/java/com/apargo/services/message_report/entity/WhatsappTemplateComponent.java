@@ -4,6 +4,7 @@ import com.apargo.services.message_report.enums.WaComponentFormat;
 import com.apargo.services.message_report.enums.WaComponentType;
 import jakarta.persistence.*;
 import lombok.Getter;
+import org.hibernate.annotations.BatchSize;
 import org.hibernate.annotations.Immutable;
 
 import java.time.Instant;
@@ -61,10 +62,12 @@ public class WhatsappTemplateComponent {
 
     // ── Relationships ─────────────────────────────────────────────────────
 
+    @BatchSize(size = 50)
     @OneToMany(mappedBy = "component", fetch = FetchType.LAZY)
     @OrderBy("buttonIndex ASC")
     private List<WhatsappTemplateButton> buttons = new ArrayList<>();
 
+    @BatchSize(size = 20)
     @OneToMany(mappedBy = "component", fetch = FetchType.LAZY)
     @OrderBy("cardIndex ASC")
     private List<WhatsappTemplateCarouselCard> carouselCards = new ArrayList<>();
