@@ -649,7 +649,7 @@ public class DataSeeder implements CommandLineRunner {
     // ══════════════════════════════════════════════════════════════════════
 
     /** Total messages to insert in --messages-only full run */
-    private static final int TARGET_MESSAGES_FULL  = 10_000_000;   // 1 crore
+    private static final int TARGET_MESSAGES_FULL  = 10_000_00;   // 1 crore
 
     /** Total messages to insert in --quick run */
     private static final int TARGET_MESSAGES_QUICK =    100_000;   // quick smoke test

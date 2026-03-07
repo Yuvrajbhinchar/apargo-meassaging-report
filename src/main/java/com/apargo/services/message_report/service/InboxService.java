@@ -1,6 +1,7 @@
 package com.apargo.services.message_report.service;
 
 import com.apargo.services.message_report.dto.request.InboxFilterRequest;
+import com.apargo.services.message_report.dto.response.ConversationCountResponse;
 import com.apargo.services.message_report.dto.response.CursorPageResponse;
 import com.apargo.services.message_report.dto.response.CursorUtil;
 import com.apargo.services.message_report.dto.response.InboxItemResponse;
@@ -27,98 +28,166 @@ public class InboxService {
     private final ConversationRepository conversationRepo;
 
     // ══════════════════════════════════════════════════════════════════════
-    //  INBOX  — open conversations only (status forced to OPEN)
+    //  ① INBOX — data + totalCount  (original)
+    //     GET /api/chats/inbox
     // ══════════════════════════════════════════════════════════════════════
 
     public CursorPageResponse<InboxItemResponse> getInbox(InboxFilterRequest req) {
         req.setStatus(ConversationStatus.OPEN);
-        return fetchPage(req);
+        return fetchPage(req, true);
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    //  MESSAGE HISTORY — all conversations; status optional filter
+    //  ② INBOX — data ONLY, no COUNT  (new faster endpoint)
+    //     GET /api/chats/inbox/data
+    // ══════════════════════════════════════════════════════════════════════
+
+    public CursorPageResponse<InboxItemResponse> getInboxDataOnly(InboxFilterRequest req) {
+        req.setStatus(ConversationStatus.OPEN);
+        return fetchPage(req, false);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    //  ③ INBOX — count ONLY  (new dedicated count endpoint)
+    //     GET /api/chats/inbox/count
+    //     Returns totalCount + unreadTotal
+    // ══════════════════════════════════════════════════════════════════════
+
+    public ConversationCountResponse getInboxCount(InboxFilterRequest req) {
+        req.setStatus(ConversationStatus.OPEN);
+
+        long total = conversationRepo.countFiltered(
+                req.getProjectId(),
+                req.getStatus(),
+                req.getAssignedType(),
+                req.getAssignedId(),
+                bool(req.getUnreadOnly()),
+                bool(req.getActiveSession()),
+                req.getFromDate(),
+                req.getToDate(),
+                blankToNull(req.getSearch())
+        );
+
+        long unreadTotal = conversationRepo.sumUnreadByProject(req.getProjectId());
+
+        return ConversationCountResponse.builder()
+                .totalCount(total)
+                .unreadTotal(unreadTotal)
+                .build();
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    //  ④ MESSAGE HISTORY — data + totalCount  (original)
+    //     GET /api/v1/get-messages-history
     // ══════════════════════════════════════════════════════════════════════
 
     public CursorPageResponse<InboxItemResponse> getMessageHistory(InboxFilterRequest req) {
-        // status stays null (= all) unless caller passes e.g. ?status=CLOSED
-        return fetchPage(req);
+        return fetchPage(req, true);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    //  ⑤ MESSAGE HISTORY — data ONLY, no COUNT  (new faster endpoint)
+    //     GET /api/v1/get-messages-history/data
+    // ══════════════════════════════════════════════════════════════════════
+
+    public CursorPageResponse<InboxItemResponse> getMessageHistoryDataOnly(InboxFilterRequest req) {
+        return fetchPage(req, false);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    //  ⑥ MESSAGE HISTORY — count ONLY  (new dedicated count endpoint)
+    //     GET /api/v1/get-messages-history/count
+    //     Returns totalCount only (unreadTotal = null for history)
+    // ══════════════════════════════════════════════════════════════════════
+
+    public ConversationCountResponse getMessageHistoryCount(InboxFilterRequest req) {
+        long total = conversationRepo.countFiltered(
+                req.getProjectId(),
+                req.getStatus(),
+                req.getAssignedType(),
+                req.getAssignedId(),
+                bool(req.getUnreadOnly()),
+                bool(req.getActiveSession()),
+                req.getFromDate(),
+                req.getToDate(),
+                blankToNull(req.getSearch())
+        );
+
+        return ConversationCountResponse.builder()
+                .totalCount(total)
+                .unreadTotal(null)   // not relevant for history — omitted from JSON
+                .build();
     }
 
     // ══════════════════════════════════════════════════════════════════════
     //  SHARED CORE
+    //  withCount = true  → runs COUNT on first page  (original behaviour)
+    //  withCount = false → skips COUNT entirely      (data-only endpoints)
     // ══════════════════════════════════════════════════════════════════════
 
-    private CursorPageResponse<InboxItemResponse> fetchPage(InboxFilterRequest req) {
+    private CursorPageResponse<InboxItemResponse> fetchPage(
+            InboxFilterRequest req,
+            boolean            withCount
+    ) {
+        int     size          = Math.min(req.getSize(), MAX_PAGE_SIZE);
+        Pageable limit        = PageRequest.of(0, size + 1);   // +1 probe for hasMore
+        boolean unreadOnly    = bool(req.getUnreadOnly());
+        boolean activeSession = bool(req.getActiveSession());
 
-        int size = Math.min(req.getSize(), MAX_PAGE_SIZE);
-
-        // Fetch size+1 to detect next page without a separate COUNT query on scroll
-        Pageable limit = PageRequest.of(0, size + 1);
-
-        boolean unreadOnly    = Boolean.TRUE.equals(req.getUnreadOnly());
-        boolean activeSession = Boolean.TRUE.equals(req.getActiveSession());
-
-        // Typed enums — Hibernate resolves bind type correctly even when null
-        ConversationStatus status       = req.getStatus();        // null = no filter
-        AssignedType       assignedType = req.getAssignedType();  // null = no filter
+        ConversationStatus status       = req.getStatus();
+        AssignedType       assignedType = req.getAssignedType();
         String             search       = blankToNull(req.getSearch());
+        Instant            fromDate     = req.getFromDate();
+        Instant            toDate       = req.getToDate();
 
         List<InboxProjection> rows;
 
         if (req.getCursor() == null) {
-            // ── First page ───────────────────────────────────────────────
+            // ── First page ────────────────────────────────────────────────
             rows = conversationRepo.findFirstPage(
                     req.getProjectId(),
-                    status,
-                    assignedType,
-                    req.getAssignedId(),
-                    unreadOnly,
-                    activeSession,
+                    status, assignedType, req.getAssignedId(),
+                    unreadOnly, activeSession,
+                    fromDate, toDate,
                     search,
                     limit
             );
         } else {
-            // ── Subsequent pages ─────────────────────────────────────────
+            // ── Subsequent pages (cursor scroll) ──────────────────────────
             long[]  parts      = CursorUtil.decode(req.getCursor());
             Instant cursorTime = Instant.ofEpochMilli(parts[0]);
             long    cursorId   = parts[1];
 
             rows = conversationRepo.findNextPage(
                     req.getProjectId(),
-                    status,
-                    assignedType,
-                    req.getAssignedId(),
-                    unreadOnly,
-                    activeSession,
+                    status, assignedType, req.getAssignedId(),
+                    unreadOnly, activeSession,
+                    fromDate, toDate,
                     search,
-                    cursorTime,
-                    cursorId,
+                    cursorTime, cursorId,
                     limit
             );
         }
 
-        // ── Detect next page via probe row ────────────────────────────────
+        // ── hasMore probe ──────────────────────────────────────────────────
         boolean hasMore = rows.size() > size;
         if (hasMore) rows = rows.subList(0, size);
 
-        // ── Build cursor from last row ────────────────────────────────────
+        // ── Build next cursor from last row ────────────────────────────────
         String nextCursor = null;
         if (hasMore) {
             InboxProjection last = rows.get(rows.size() - 1);
             nextCursor = CursorUtil.encode(last.getLastMessageAt(), last.getConversationId());
         }
 
-        // ── totalCount only on first page (avoid repeated COUNT on every scroll) ──
-        // Returns Long (boxed) — null on page 2+ so @JsonInclude(NON_NULL) omits it
+        // ── totalCount — first page only, only when withCount = true ───────
         Long totalCount = null;
-        if (req.getCursor() == null) {
+        if (withCount && req.getCursor() == null) {
             totalCount = conversationRepo.countFiltered(
                     req.getProjectId(),
-                    status,
-                    assignedType,
-                    req.getAssignedId(),
-                    unreadOnly,
-                    activeSession,
+                    status, assignedType, req.getAssignedId(),
+                    unreadOnly, activeSession,
+                    fromDate, toDate,
                     search
             );
         }
@@ -130,7 +199,7 @@ public class InboxService {
         return CursorPageResponse.<InboxItemResponse>builder()
                 .data(data)
                 .pageSize(data.size())
-                .totalCount(totalCount)   // null on page 2+ → omitted from JSON
+                .totalCount(totalCount)
                 .nextCursor(nextCursor)
                 .hasMore(hasMore)
                 .build();
@@ -138,7 +207,6 @@ public class InboxService {
 
     // ── Helpers ───────────────────────────────────────────────────────────
 
-    private String blankToNull(String s) {
-        return (s == null || s.isBlank()) ? null : s.trim();
-    }
+    private boolean bool(Boolean b)      { return Boolean.TRUE.equals(b); }
+    private String blankToNull(String s) { return (s == null || s.isBlank()) ? null : s.trim(); }
 }

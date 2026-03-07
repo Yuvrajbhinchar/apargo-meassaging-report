@@ -17,44 +17,38 @@ import java.util.List;
 public interface ConversationRepository extends JpaRepository<Conversation, Long> {
 
     // ══════════════════════════════════════════════════════════════════════
-    //  CORE INBOX QUERY
-    //  Single JOIN — 3 tables max, hits idx_inbox (project_id, waba_account_id, last_message_at)
-    //  Cursor keyset: (last_message_at DESC, id DESC) — O(1) at any depth
+    //  FIRST PAGE — no cursor
+    //
+    //  fromDate / toDate filter on last_message_at:
+    //    • null = no bound (ignored in WHERE)
+    //    • Instant = filter conversations whose last message falls in range
+    //
+    //  Index hit: idx_inbox (project_id, status, last_message_at DESC)
+    //  The date range sits on last_message_at which is the index's 3rd column
+    //  so MySQL can apply it as a range scan — no filesort needed.
     // ══════════════════════════════════════════════════════════════════════
 
-    /**
-     * FIRST PAGE — no cursor.
-     * Shared by Inbox (status=OPEN) and Message History (status=null → all).
-     *
-     * WHY typed enums instead of Object?
-     *   Hibernate 6 resolves bind types from the parameter value at runtime.
-     *   When the value is null and the type is Object, Hibernate CANNOT infer
-     *   the ENUM bind type → throws QueryException or silently binds as VARCHAR
-     *   causing the comparison to always fail.
-     *   Passing a typed enum (ConversationStatus / AssignedType) or null gives
-     *   Hibernate the type info it needs even when the value is null.
-     */
     @Query("""
         SELECT
-            conv.id                   AS conversationId,
-            conv.contactId            AS contactId,
-            conv.wabaAccountId        AS wabaAccountId,
-            conv.status               AS status,
-            conv.assignedType         AS assignedType,
-            conv.assignedId           AS assignedId,
-            conv.lastMessageAt        AS lastMessageAt,
-            conv.lastMessageDirection AS lastMessageDirection,
-            conv.lastMessagePreview   AS lastMessagePreview,
-            conv.unreadCount          AS unreadCount,
+            conv.id                    AS conversationId,
+            conv.contactId             AS contactId,
+            conv.wabaAccountId         AS wabaAccountId,
+            conv.status                AS status,
+            conv.assignedType          AS assignedType,
+            conv.assignedId            AS assignedId,
+            conv.lastMessageAt         AS lastMessageAt,
+            conv.lastMessageDirection  AS lastMessageDirection,
+            conv.lastMessagePreview    AS lastMessagePreview,
+            conv.unreadCount           AS unreadCount,
             conv.conversationOpenUntil AS conversationOpenUntil,
-            conv.lastInboundAt        AS lastInboundAt,
-            conv.lastMessageId        AS lastMessageId,
-            c.displayName             AS contactName,
-            c.waPhoneE164             AS contactPhone,
-            msr.isSent                AS isSent,
-            msr.isDelivered           AS isDelivered,
-            msr.isRead                AS isRead,
-            msr.isFailed              AS isFailed
+            conv.lastInboundAt         AS lastInboundAt,
+            conv.lastMessageId         AS lastMessageId,
+            c.displayName              AS contactName,
+            c.waPhoneE164              AS contactPhone,
+            msr.isSent                 AS isSent,
+            msr.isDelivered            AS isDelivered,
+            msr.isRead                 AS isRead,
+            msr.isFailed               AS isFailed
         FROM Conversation conv
         JOIN Contact c ON c.id = conv.contactId
         LEFT JOIN MessageStatusRollup msr ON msr.messageId = conv.lastMessageId
@@ -64,47 +58,56 @@ public interface ConversationRepository extends JpaRepository<Conversation, Long
           AND (:assignedId    IS NULL OR conv.assignedId   = :assignedId)
           AND (:unreadOnly    = FALSE  OR conv.unreadCount > 0)
           AND (:activeSession = FALSE  OR conv.conversationOpenUntil > CURRENT_TIMESTAMP)
+          AND (:fromDate      IS NULL  OR conv.lastMessageAt >= :fromDate)
+          AND (:toDate        IS NULL  OR conv.lastMessageAt <= :toDate)
           AND (:search        IS NULL
                OR LOWER(c.displayName) LIKE LOWER(CONCAT('%', :search, '%'))
                OR c.waPhoneE164        LIKE CONCAT('%', :search, '%'))
         ORDER BY conv.lastMessageAt DESC, conv.id DESC
         """)
     List<InboxProjection> findFirstPage(
-            @Param("projectId")     Long projectId,
-            @Param("status")        ConversationStatus status,   // typed — null OK
-            @Param("assignedType")  AssignedType assignedType,   // typed — null OK
-            @Param("assignedId")    Long assignedId,
-            @Param("unreadOnly")    boolean unreadOnly,
-            @Param("activeSession") boolean activeSession,
-            @Param("search")        String search,
-            Pageable pageable
+            @Param("projectId")     Long               projectId,
+            @Param("status")        ConversationStatus status,
+            @Param("assignedType")  AssignedType       assignedType,
+            @Param("assignedId")    Long               assignedId,
+            @Param("unreadOnly")    boolean            unreadOnly,
+            @Param("activeSession") boolean            activeSession,
+            @Param("fromDate")      Instant            fromDate,
+            @Param("toDate")        Instant            toDate,
+            @Param("search")        String             search,
+            Pageable               pageable
     );
 
-    /**
-     * NEXT PAGES — cursor carries (lastMessageAt, conversationId) from previous last row.
-     * The keyset condition routes directly into idx_inbox — no full scan.
-     */
+    // ══════════════════════════════════════════════════════════════════════
+    //  NEXT PAGES — keyset cursor (lastMessageAt, conversationId)
+    //
+    //  Date filter works alongside the cursor:
+    //    cursor condition : (lastMessageAt < cursorTime OR ...)
+    //    date condition   : (lastMessageAt >= fromDate AND lastMessageAt <= toDate)
+    //  Both apply together — cursor narrows within the date-filtered window.
+    // ══════════════════════════════════════════════════════════════════════
+
     @Query("""
         SELECT
-            conv.id                   AS conversationId,
-            conv.contactId            AS contactId,
-            conv.wabaAccountId        AS wabaAccountId,
-            conv.status               AS status,
-            conv.assignedType         AS assignedType,
-            conv.assignedId           AS assignedId,
-            conv.lastMessageAt        AS lastMessageAt,
-            conv.lastMessageDirection AS lastMessageDirection,
-            conv.lastMessagePreview   AS lastMessagePreview,
-            conv.unreadCount          AS unreadCount,
+            conv.id                    AS conversationId,
+            conv.contactId             AS contactId,
+            conv.wabaAccountId         AS wabaAccountId,
+            conv.status                AS status,
+            conv.assignedType          AS assignedType,
+            conv.assignedId            AS assignedId,
+            conv.lastMessageAt         AS lastMessageAt,
+            conv.lastMessageDirection  AS lastMessageDirection,
+            conv.lastMessagePreview    AS lastMessagePreview,
+            conv.unreadCount           AS unreadCount,
             conv.conversationOpenUntil AS conversationOpenUntil,
-            conv.lastInboundAt        AS lastInboundAt,
-            conv.lastMessageId        AS lastMessageId,
-            c.displayName             AS contactName,
-            c.waPhoneE164             AS contactPhone,
-            msr.isSent                AS isSent,
-            msr.isDelivered           AS isDelivered,
-            msr.isRead                AS isRead,
-            msr.isFailed              AS isFailed
+            conv.lastInboundAt         AS lastInboundAt,
+            conv.lastMessageId         AS lastMessageId,
+            c.displayName              AS contactName,
+            c.waPhoneE164              AS contactPhone,
+            msr.isSent                 AS isSent,
+            msr.isDelivered            AS isDelivered,
+            msr.isRead                 AS isRead,
+            msr.isFailed               AS isFailed
         FROM Conversation conv
         JOIN Contact c ON c.id = conv.contactId
         LEFT JOIN MessageStatusRollup msr ON msr.messageId = conv.lastMessageId
@@ -114,6 +117,8 @@ public interface ConversationRepository extends JpaRepository<Conversation, Long
           AND (:assignedId    IS NULL OR conv.assignedId   = :assignedId)
           AND (:unreadOnly    = FALSE  OR conv.unreadCount > 0)
           AND (:activeSession = FALSE  OR conv.conversationOpenUntil > CURRENT_TIMESTAMP)
+          AND (:fromDate      IS NULL  OR conv.lastMessageAt >= :fromDate)
+          AND (:toDate        IS NULL  OR conv.lastMessageAt <= :toDate)
           AND (:search        IS NULL
                OR LOWER(c.displayName) LIKE LOWER(CONCAT('%', :search, '%'))
                OR c.waPhoneE164        LIKE CONCAT('%', :search, '%'))
@@ -122,20 +127,23 @@ public interface ConversationRepository extends JpaRepository<Conversation, Long
         ORDER BY conv.lastMessageAt DESC, conv.id DESC
         """)
     List<InboxProjection> findNextPage(
-            @Param("projectId")     Long projectId,
+            @Param("projectId")     Long               projectId,
             @Param("status")        ConversationStatus status,
-            @Param("assignedType")  AssignedType assignedType,
-            @Param("assignedId")    Long assignedId,
-            @Param("unreadOnly")    boolean unreadOnly,
-            @Param("activeSession") boolean activeSession,
-            @Param("search")        String search,
-            @Param("cursorTime")    Instant cursorTime,
-            @Param("cursorId")      Long cursorId,
-            Pageable pageable
+            @Param("assignedType")  AssignedType       assignedType,
+            @Param("assignedId")    Long               assignedId,
+            @Param("unreadOnly")    boolean            unreadOnly,
+            @Param("activeSession") boolean            activeSession,
+            @Param("fromDate")      Instant            fromDate,
+            @Param("toDate")        Instant            toDate,
+            @Param("search")        String             search,
+            @Param("cursorTime")    Instant            cursorTime,
+            @Param("cursorId")      Long               cursorId,
+            Pageable               pageable
     );
 
     // ══════════════════════════════════════════════════════════════════════
-    //  COUNT — only called on first page, never on scroll pages
+    //  COUNT — first page only, same WHERE as findFirstPage
+    //  Date filter included so count matches the filtered list exactly.
     // ══════════════════════════════════════════════════════════════════════
 
     @Query("""
@@ -148,21 +156,25 @@ public interface ConversationRepository extends JpaRepository<Conversation, Long
           AND (:assignedId    IS NULL OR conv.assignedId   = :assignedId)
           AND (:unreadOnly    = FALSE  OR conv.unreadCount > 0)
           AND (:activeSession = FALSE  OR conv.conversationOpenUntil > CURRENT_TIMESTAMP)
+          AND (:fromDate      IS NULL  OR conv.lastMessageAt >= :fromDate)
+          AND (:toDate        IS NULL  OR conv.lastMessageAt <= :toDate)
           AND (:search        IS NULL
                OR LOWER(c.displayName) LIKE LOWER(CONCAT('%', :search, '%'))
                OR c.waPhoneE164        LIKE CONCAT('%', :search, '%'))
         """)
     long countFiltered(
-            @Param("projectId")     Long projectId,
+            @Param("projectId")     Long               projectId,
             @Param("status")        ConversationStatus status,
-            @Param("assignedType")  AssignedType assignedType,
-            @Param("assignedId")    Long assignedId,
-            @Param("unreadOnly")    boolean unreadOnly,
-            @Param("activeSession") boolean activeSession,
-            @Param("search")        String search
+            @Param("assignedType")  AssignedType       assignedType,
+            @Param("assignedId")    Long               assignedId,
+            @Param("unreadOnly")    boolean            unreadOnly,
+            @Param("activeSession") boolean            activeSession,
+            @Param("fromDate")      Instant            fromDate,
+            @Param("toDate")        Instant            toDate,
+            @Param("search")        String             search
     );
 
-    // ── Fast unread badge (no join needed) ────────────────────────────────
+    // ── Fast unread badge (no join, no date filter needed) ────────────────
     @Query("""
         SELECT COALESCE(SUM(conv.unreadCount), 0)
         FROM Conversation conv
