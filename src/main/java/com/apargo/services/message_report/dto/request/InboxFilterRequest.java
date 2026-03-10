@@ -11,14 +11,18 @@ import java.time.Instant;
 @Setter
 public class InboxFilterRequest {
 
-    // ── Required ──────────────────────────────────────────────────────────
+    // ── From headers (set by controller, not the client) ─────────────────
+    private Long   organizationId;   // from X-Organization-Id header
+    private Long   userId;           // from X-User-Id header
+
+    // ── Required query param ──────────────────────────────────────────────
     private Long   projectId;
 
     // ── Pagination ────────────────────────────────────────────────────────
     private String cursor;
     private int    size = 20;
 
-    // ── Filters ───────────────────────────────────────────────────────────
+    // ── Optional filters ─────────────────────────────────────────────────
     private ConversationStatus status;
     private AssignedType       assignedType;
     private Long               assignedId;
@@ -26,11 +30,7 @@ public class InboxFilterRequest {
     private Boolean            activeSession;
     private String             search;
 
-    // ── Date range (filters on last_message_at) ───────────────────────────
-    // Parsed from "yyyy-MM-dd" in the controller before reaching here.
-    // fromDate = 2025-01-01T00:00:00Z  (start of day UTC)
-    // toDate   = 2025-03-31T23:59:59Z  (end   of day UTC)
-    // null = no bound applied
+    // ── Date range ────────────────────────────────────────────────────────
     private Instant fromDate;
     private Instant toDate;
 }

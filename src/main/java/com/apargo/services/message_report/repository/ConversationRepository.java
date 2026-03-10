@@ -16,18 +16,7 @@ import java.util.List;
 @Repository
 public interface ConversationRepository extends JpaRepository<Conversation, Long> {
 
-    // ══════════════════════════════════════════════════════════════════════
-    //  FIRST PAGE — no cursor
-    //
-    //  fromDate / toDate filter on last_message_at:
-    //    • null = no bound (ignored in WHERE)
-    //    • Instant = filter conversations whose last message falls in range
-    //
-    //  Index hit: idx_inbox (project_id, status, last_message_at DESC)
-    //  The date range sits on last_message_at which is the index's 3rd column
-    //  so MySQL can apply it as a range scan — no filesort needed.
-    // ══════════════════════════════════════════════════════════════════════
-
+    // ── FIRST PAGE ────────────────────────────────────────────────────────
     @Query("""
         SELECT
             conv.id                    AS conversationId,
@@ -52,8 +41,14 @@ public interface ConversationRepository extends JpaRepository<Conversation, Long
         FROM Conversation conv
         JOIN Contact c ON c.id = conv.contactId
         LEFT JOIN MessageStatusRollup msr ON msr.messageId = conv.lastMessageId
-        WHERE conv.projectId = :projectId
+        WHERE conv.projectId      = :projectId
+          AND conv.organizationId = :organizationId
           AND (:status        IS NULL OR conv.status       = :status)
+          AND (
+                :userId       IS NULL
+                OR (conv.assignedType = com.apargo.services.message_report.enums.AssignedType.USER
+                    AND conv.assignedId = :userId)
+              )
           AND (:assignedType  IS NULL OR conv.assignedType = :assignedType)
           AND (:assignedId    IS NULL OR conv.assignedId   = :assignedId)
           AND (:unreadOnly    = FALSE  OR conv.unreadCount > 0)
@@ -66,27 +61,21 @@ public interface ConversationRepository extends JpaRepository<Conversation, Long
         ORDER BY conv.lastMessageAt DESC, conv.id DESC
         """)
     List<InboxProjection> findFirstPage(
-            @Param("projectId")     Long               projectId,
-            @Param("status")        ConversationStatus status,
-            @Param("assignedType")  AssignedType       assignedType,
-            @Param("assignedId")    Long               assignedId,
-            @Param("unreadOnly")    boolean            unreadOnly,
-            @Param("activeSession") boolean            activeSession,
-            @Param("fromDate")      Instant            fromDate,
-            @Param("toDate")        Instant            toDate,
-            @Param("search")        String             search,
-            Pageable               pageable
+            @Param("projectId")      Long               projectId,
+            @Param("organizationId") Long               organizationId,
+            @Param("status")         ConversationStatus status,
+            @Param("userId")         Long               userId,
+            @Param("assignedType")   AssignedType       assignedType,
+            @Param("assignedId")     Long               assignedId,
+            @Param("unreadOnly")     boolean            unreadOnly,
+            @Param("activeSession")  boolean            activeSession,
+            @Param("fromDate")       Instant            fromDate,
+            @Param("toDate")         Instant            toDate,
+            @Param("search")         String             search,
+            Pageable                pageable
     );
 
-    // ══════════════════════════════════════════════════════════════════════
-    //  NEXT PAGES — keyset cursor (lastMessageAt, conversationId)
-    //
-    //  Date filter works alongside the cursor:
-    //    cursor condition : (lastMessageAt < cursorTime OR ...)
-    //    date condition   : (lastMessageAt >= fromDate AND lastMessageAt <= toDate)
-    //  Both apply together — cursor narrows within the date-filtered window.
-    // ══════════════════════════════════════════════════════════════════════
-
+    // ── NEXT PAGES ────────────────────────────────────────────────────────
     @Query("""
         SELECT
             conv.id                    AS conversationId,
@@ -111,8 +100,14 @@ public interface ConversationRepository extends JpaRepository<Conversation, Long
         FROM Conversation conv
         JOIN Contact c ON c.id = conv.contactId
         LEFT JOIN MessageStatusRollup msr ON msr.messageId = conv.lastMessageId
-        WHERE conv.projectId = :projectId
+        WHERE conv.projectId      = :projectId
+          AND conv.organizationId = :organizationId
           AND (:status        IS NULL OR conv.status       = :status)
+          AND (
+                :userId       IS NULL
+                OR (conv.assignedType = com.apargo.services.message_report.enums.AssignedType.USER
+                    AND conv.assignedId = :userId)
+              )
           AND (:assignedType  IS NULL OR conv.assignedType = :assignedType)
           AND (:assignedId    IS NULL OR conv.assignedId   = :assignedId)
           AND (:unreadOnly    = FALSE  OR conv.unreadCount > 0)
@@ -127,31 +122,35 @@ public interface ConversationRepository extends JpaRepository<Conversation, Long
         ORDER BY conv.lastMessageAt DESC, conv.id DESC
         """)
     List<InboxProjection> findNextPage(
-            @Param("projectId")     Long               projectId,
-            @Param("status")        ConversationStatus status,
-            @Param("assignedType")  AssignedType       assignedType,
-            @Param("assignedId")    Long               assignedId,
-            @Param("unreadOnly")    boolean            unreadOnly,
-            @Param("activeSession") boolean            activeSession,
-            @Param("fromDate")      Instant            fromDate,
-            @Param("toDate")        Instant            toDate,
-            @Param("search")        String             search,
-            @Param("cursorTime")    Instant            cursorTime,
-            @Param("cursorId")      Long               cursorId,
-            Pageable               pageable
+            @Param("projectId")      Long               projectId,
+            @Param("organizationId") Long               organizationId,
+            @Param("status")         ConversationStatus status,
+            @Param("userId")         Long               userId,
+            @Param("assignedType")   AssignedType       assignedType,
+            @Param("assignedId")     Long               assignedId,
+            @Param("unreadOnly")     boolean            unreadOnly,
+            @Param("activeSession")  boolean            activeSession,
+            @Param("fromDate")       Instant            fromDate,
+            @Param("toDate")         Instant            toDate,
+            @Param("search")         String             search,
+            @Param("cursorTime")     Instant            cursorTime,
+            @Param("cursorId")       Long               cursorId,
+            Pageable                pageable
     );
 
-    // ══════════════════════════════════════════════════════════════════════
-    //  COUNT — first page only, same WHERE as findFirstPage
-    //  Date filter included so count matches the filtered list exactly.
-    // ══════════════════════════════════════════════════════════════════════
-
+    // ── COUNT ─────────────────────────────────────────────────────────────
     @Query("""
         SELECT COUNT(conv.id)
         FROM Conversation conv
         JOIN Contact c ON c.id = conv.contactId
-        WHERE conv.projectId = :projectId
+        WHERE conv.projectId      = :projectId
+          AND conv.organizationId = :organizationId
           AND (:status        IS NULL OR conv.status       = :status)
+          AND (
+                :userId       IS NULL
+                OR (conv.assignedType = com.apargo.services.message_report.enums.AssignedType.USER
+                    AND conv.assignedId = :userId)
+              )
           AND (:assignedType  IS NULL OR conv.assignedType = :assignedType)
           AND (:assignedId    IS NULL OR conv.assignedId   = :assignedId)
           AND (:unreadOnly    = FALSE  OR conv.unreadCount > 0)
@@ -163,23 +162,29 @@ public interface ConversationRepository extends JpaRepository<Conversation, Long
                OR c.waPhoneE164        LIKE CONCAT('%', :search, '%'))
         """)
     long countFiltered(
-            @Param("projectId")     Long               projectId,
-            @Param("status")        ConversationStatus status,
-            @Param("assignedType")  AssignedType       assignedType,
-            @Param("assignedId")    Long               assignedId,
-            @Param("unreadOnly")    boolean            unreadOnly,
-            @Param("activeSession") boolean            activeSession,
-            @Param("fromDate")      Instant            fromDate,
-            @Param("toDate")        Instant            toDate,
-            @Param("search")        String             search
+            @Param("projectId")      Long               projectId,
+            @Param("organizationId") Long               organizationId,
+            @Param("status")         ConversationStatus status,
+            @Param("userId")         Long               userId,
+            @Param("assignedType")   AssignedType       assignedType,
+            @Param("assignedId")     Long               assignedId,
+            @Param("unreadOnly")     boolean            unreadOnly,
+            @Param("activeSession")  boolean            activeSession,
+            @Param("fromDate")       Instant            fromDate,
+            @Param("toDate")         Instant            toDate,
+            @Param("search")         String             search
     );
 
-    // ── Fast unread badge (no join, no date filter needed) ────────────────
+    // ── UNREAD BADGE ──────────────────────────────────────────────────────
     @Query("""
         SELECT COALESCE(SUM(conv.unreadCount), 0)
         FROM Conversation conv
-        WHERE conv.projectId = :projectId
+        WHERE conv.projectId      = :projectId
+          AND conv.organizationId = :organizationId
           AND conv.status = com.apargo.services.message_report.enums.ConversationStatus.OPEN
         """)
-    long sumUnreadByProject(@Param("projectId") Long projectId);
+    long sumUnreadByProject(
+            @Param("projectId")      Long projectId,
+            @Param("organizationId") Long organizationId
+    );
 }

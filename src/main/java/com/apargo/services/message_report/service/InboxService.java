@@ -27,38 +27,24 @@ public class InboxService {
 
     private final ConversationRepository conversationRepo;
 
-    // ══════════════════════════════════════════════════════════════════════
-    //  ① INBOX — data + totalCount  (original)
-    //     GET /api/chats/inbox
-    // ══════════════════════════════════════════════════════════════════════
-
     public CursorPageResponse<InboxItemResponse> getInbox(InboxFilterRequest req) {
         req.setStatus(ConversationStatus.OPEN);
         return fetchPage(req, true);
     }
-
-    // ══════════════════════════════════════════════════════════════════════
-    //  ② INBOX — data ONLY, no COUNT  (new faster endpoint)
-    //     GET /api/chats/inbox/data
-    // ══════════════════════════════════════════════════════════════════════
 
     public CursorPageResponse<InboxItemResponse> getInboxDataOnly(InboxFilterRequest req) {
         req.setStatus(ConversationStatus.OPEN);
         return fetchPage(req, false);
     }
 
-    // ══════════════════════════════════════════════════════════════════════
-    //  ③ INBOX — count ONLY  (new dedicated count endpoint)
-    //     GET /api/chats/inbox/count
-    //     Returns totalCount + unreadTotal
-    // ══════════════════════════════════════════════════════════════════════
-
     public ConversationCountResponse getInboxCount(InboxFilterRequest req) {
         req.setStatus(ConversationStatus.OPEN);
 
         long total = conversationRepo.countFiltered(
                 req.getProjectId(),
+                req.getOrganizationId(),
                 req.getStatus(),
+                req.getUserId(),
                 req.getAssignedType(),
                 req.getAssignedId(),
                 bool(req.getUnreadOnly()),
@@ -68,7 +54,10 @@ public class InboxService {
                 blankToNull(req.getSearch())
         );
 
-        long unreadTotal = conversationRepo.sumUnreadByProject(req.getProjectId());
+        long unreadTotal = conversationRepo.sumUnreadByProject(
+                req.getProjectId(),
+                req.getOrganizationId()
+        );
 
         return ConversationCountResponse.builder()
                 .totalCount(total)
@@ -76,34 +65,20 @@ public class InboxService {
                 .build();
     }
 
-    // ══════════════════════════════════════════════════════════════════════
-    //  ④ MESSAGE HISTORY — data + totalCount  (original)
-    //     GET /api/v1/get-messages-history
-    // ══════════════════════════════════════════════════════════════════════
-
     public CursorPageResponse<InboxItemResponse> getMessageHistory(InboxFilterRequest req) {
         return fetchPage(req, true);
     }
-
-    // ══════════════════════════════════════════════════════════════════════
-    //  ⑤ MESSAGE HISTORY — data ONLY, no COUNT  (new faster endpoint)
-    //     GET /api/v1/get-messages-history/data
-    // ══════════════════════════════════════════════════════════════════════
 
     public CursorPageResponse<InboxItemResponse> getMessageHistoryDataOnly(InboxFilterRequest req) {
         return fetchPage(req, false);
     }
 
-    // ══════════════════════════════════════════════════════════════════════
-    //  ⑥ MESSAGE HISTORY — count ONLY  (new dedicated count endpoint)
-    //     GET /api/v1/get-messages-history/count
-    //     Returns totalCount only (unreadTotal = null for history)
-    // ══════════════════════════════════════════════════════════════════════
-
     public ConversationCountResponse getMessageHistoryCount(InboxFilterRequest req) {
         long total = conversationRepo.countFiltered(
                 req.getProjectId(),
+                req.getOrganizationId(),
                 req.getStatus(),
+                req.getUserId(),
                 req.getAssignedType(),
                 req.getAssignedId(),
                 bool(req.getUnreadOnly()),
@@ -115,79 +90,72 @@ public class InboxService {
 
         return ConversationCountResponse.builder()
                 .totalCount(total)
-                .unreadTotal(null)   // not relevant for history — omitted from JSON
+                .unreadTotal(null)
                 .build();
     }
 
-    // ══════════════════════════════════════════════════════════════════════
-    //  SHARED CORE
-    //  withCount = true  → runs COUNT on first page  (original behaviour)
-    //  withCount = false → skips COUNT entirely      (data-only endpoints)
-    // ══════════════════════════════════════════════════════════════════════
-
-    private CursorPageResponse<InboxItemResponse> fetchPage(
-            InboxFilterRequest req,
-            boolean            withCount
-    ) {
-        int     size          = Math.min(req.getSize(), MAX_PAGE_SIZE);
-        Pageable limit        = PageRequest.of(0, size + 1);   // +1 probe for hasMore
-        boolean unreadOnly    = bool(req.getUnreadOnly());
-        boolean activeSession = bool(req.getActiveSession());
-
-        ConversationStatus status       = req.getStatus();
-        AssignedType       assignedType = req.getAssignedType();
-        String             search       = blankToNull(req.getSearch());
-        Instant            fromDate     = req.getFromDate();
-        Instant            toDate       = req.getToDate();
+    private CursorPageResponse<InboxItemResponse> fetchPage(InboxFilterRequest req, boolean withCount) {
+        int      size          = Math.min(req.getSize(), MAX_PAGE_SIZE);
+        Pageable limit         = PageRequest.of(0, size + 1);
+        boolean  unreadOnly    = bool(req.getUnreadOnly());
+        boolean  activeSession = bool(req.getActiveSession());
+        String   search        = blankToNull(req.getSearch());
 
         List<InboxProjection> rows;
 
         if (req.getCursor() == null) {
-            // ── First page ────────────────────────────────────────────────
             rows = conversationRepo.findFirstPage(
                     req.getProjectId(),
-                    status, assignedType, req.getAssignedId(),
+                    req.getOrganizationId(),
+                    req.getStatus(),
+                    req.getUserId(),
+                    req.getAssignedType(),
+                    req.getAssignedId(),
                     unreadOnly, activeSession,
-                    fromDate, toDate,
+                    req.getFromDate(), req.getToDate(),
                     search,
                     limit
             );
         } else {
-            // ── Subsequent pages (cursor scroll) ──────────────────────────
             long[]  parts      = CursorUtil.decode(req.getCursor());
             Instant cursorTime = Instant.ofEpochMilli(parts[0]);
             long    cursorId   = parts[1];
 
             rows = conversationRepo.findNextPage(
                     req.getProjectId(),
-                    status, assignedType, req.getAssignedId(),
+                    req.getOrganizationId(),
+                    req.getStatus(),
+                    req.getUserId(),
+                    req.getAssignedType(),
+                    req.getAssignedId(),
                     unreadOnly, activeSession,
-                    fromDate, toDate,
+                    req.getFromDate(), req.getToDate(),
                     search,
                     cursorTime, cursorId,
                     limit
             );
         }
 
-        // ── hasMore probe ──────────────────────────────────────────────────
         boolean hasMore = rows.size() > size;
         if (hasMore) rows = rows.subList(0, size);
 
-        // ── Build next cursor from last row ────────────────────────────────
         String nextCursor = null;
         if (hasMore) {
             InboxProjection last = rows.get(rows.size() - 1);
             nextCursor = CursorUtil.encode(last.getLastMessageAt(), last.getConversationId());
         }
 
-        // ── totalCount — first page only, only when withCount = true ───────
         Long totalCount = null;
         if (withCount && req.getCursor() == null) {
             totalCount = conversationRepo.countFiltered(
                     req.getProjectId(),
-                    status, assignedType, req.getAssignedId(),
+                    req.getOrganizationId(),
+                    req.getStatus(),
+                    req.getUserId(),
+                    req.getAssignedType(),
+                    req.getAssignedId(),
                     unreadOnly, activeSession,
-                    fromDate, toDate,
+                    req.getFromDate(), req.getToDate(),
                     search
             );
         }
@@ -204,8 +172,6 @@ public class InboxService {
                 .hasMore(hasMore)
                 .build();
     }
-
-    // ── Helpers ───────────────────────────────────────────────────────────
 
     private boolean bool(Boolean b)      { return Boolean.TRUE.equals(b); }
     private String blankToNull(String s) { return (s == null || s.isBlank()) ? null : s.trim(); }
