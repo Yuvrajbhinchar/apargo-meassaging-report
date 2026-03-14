@@ -3,21 +3,20 @@ spring:
     name: message_report
 
   datasource:
-    url: jdbc:mysql://localhost:3306/apargo_report?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+    url: jdbc:mysql://localhost:3306/apargo_report?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC&rewriteBatchedStatements=true&useConfigs=maxPerformance
     username: root
     password: yuvraj@3933
     driver-class-name: com.mysql.cj.jdbc.Driver
     hikari:
-      minimum-idle: 5
-      maximum-pool-size: 20
+      minimum-idle: 2
+      maximum-pool-size: 20        # must be >= NUM_THREADS (8) + a few for app requests
       idle-timeout: 300000
-      connection-timeout: 20000
-
+      connection-timeout: 30000
       data-source-properties:
         cachePrepStmts: true
         prepStmtCacheSize: 250
         prepStmtCacheSqlLimit: 2048
-        useServerPrepStmts: true
+        useServerPrepStmts: false
 
   jpa:
     hibernate:
@@ -28,7 +27,6 @@ spring:
       hibernate:
         dialect: org.hibernate.dialect.MySQLDialect
         format_sql: true
-        # Batch inserts for broadcast recipients
         jdbc:
           batch_size: 50
         order_inserts: true
@@ -40,5 +38,5 @@ server:
 logging:
   level:
     com.apargo.services.message_report: INFO
-    org.hibernate.SQL: INFO        # set to INFO in prod
-    org.hibernate.type.descriptor: INFO  # comment out in prod
+    org.hibernate.SQL: INFO
+    org.hibernate.type.descriptor: INFO

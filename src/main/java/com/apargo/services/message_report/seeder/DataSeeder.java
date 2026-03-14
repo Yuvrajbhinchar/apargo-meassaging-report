@@ -20,9 +20,21 @@ import java.util.concurrent.atomic.AtomicLong;
 /**
  * ══════════════════════════════════════════════════════════════════════════════
  *  Production-Scale Data Seeder — 1 Crore (10,000,000) Messages
- *  Multi-threaded: 8 worker threads on a 4-core CPU (hyper-threaded).
- * ══════════════════════════════════════════════════════════════════════════════
+ *  Multi-threaded: 8 worker threads, each inserting 1,250,000 rows = 10M total.
  *
+ * ══════════════════════════════════════════════════════════════════════════════
+ *  PERFORMANCE REQUIREMENTS (must be met before running):
+ *  ───────────────────────────────────────────────────────
+ *  In application.yaml JDBC URL:
+ *    rewriteBatchedStatements=true    ← rewrites addBatch() into multi-row INSERT
+ *    useConfigs=maxPerformance        ← disables unnecessary round-trips
+ *  In hikari data-source-properties:
+ *    useServerPrepStmts: false        ← MUST be false; conflicts with batch rewrite
+ *
+ *  Without rewriteBatchedStatements=true the driver sends 10,000 individual
+ *  INSERT statements per batch instead of one multi-row INSERT — ~100x slower.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════
  *  HOW TO RUN:
  *  ──────────
  *    Full seed (contacts + conversations + messages):
@@ -34,61 +46,59 @@ import java.util.concurrent.atomic.AtomicLong;
  *    Quick smoke test (100k messages only):
  *      --seed --messages-only --quick
  *
- *  Terminal:
- *    mvn spring-boot:run "-Dspring-boot.run.arguments=--seed --messages-only"
+ *  Terminal (PowerShell):
+ *    ./mvnw spring-boot:run "-Dspring-boot.run.arguments=--seed --messages-only"
  *
- *  ══════════════════════════════════════════════════════════════════════════
+ * ══════════════════════════════════════════════════════════════════════════════
  *  THREADING MODEL:
  *  ────────────────
- *  • totalMessages is split evenly across NUM_THREADS workers.
+ *  • totalMessages split evenly: NUM_THREADS x perThread = totalMessages.
  *  • Each worker holds ONE dedicated JDBC Connection for its entire lifetime
  *    so SET foreign_key_checks=0 stays pinned to that connection.
- *  • Generated keys (message IDs) are retrieved via
- *    PreparedStatement.RETURN_GENERATED_KEYS — no SELECT MAX(id) race condition.
- *  • AtomicLong tracks global insertion count; a monitor thread logs
- *    progress + rows/sec + ETA every 10 seconds.
+ *  • Generated keys (message IDs) via RETURN_GENERATED_KEYS — no race condition.
+ *  • AtomicLong tracks global count; monitor thread logs progress every 5 s.
  *  • After all workers finish, lastMsgPerConv maps are merged and
- *    backfill + verification run on the main thread.
- * ══════════════════════════════════════════════════════════════════════════
+ *    conversations.last_message_id is backfilled on the main thread.
+ * ══════════════════════════════════════════════════════════════════════════════
  */
 @Slf4j
 @Component
 @RequiredArgsConstructor
 public class DataSeeder implements CommandLineRunner {
 
-    private final JdbcTemplate      jdbc;
-    private final DataSource        dataSource;   // ← needed for per-thread connections
+    private final JdbcTemplate       jdbc;
+    private final DataSource         dataSource;
     private final ApplicationContext ctx;
 
     // ══════════════════════════════════════════════════════════════════════
     //  CONFIG
     // ══════════════════════════════════════════════════════════════════════
 
-    /** Worker threads — 2× physical cores for I/O-bound JDBC work */
-    private static final int NUM_THREADS           =      8;
+    /** Worker threads — 2x physical cores works well for I/O-bound JDBC inserts */
+    private static final int  NUM_THREADS           =     8;
 
-    /** Total messages in --messages-only full run */
-    private static final int TARGET_MESSAGES_FULL  = 10_000_000;
+    /** Total messages target for a full run */
+    private static final int  TARGET_MESSAGES_FULL  = 10_000_000;
 
-    /** Total messages in --quick run */
-    private static final int TARGET_MESSAGES_QUICK =    100_000;
+    /** Total messages target for --quick smoke test */
+    private static final int  TARGET_MESSAGES_QUICK =    100_000;
 
     /**
-     * Rows per executeBatch() call inside each worker.
-     * Smaller = more frequent commits + less memory; larger = faster throughput.
-     * 5 000 is a good balance for MySQL.
+     * Rows per executeBatch() call.
+     * With rewriteBatchedStatements=true this becomes one giant multi-row INSERT.
+     * 10,000 is optimal: large enough for throughput, small enough for memory.
      */
-    private static final int DB_BATCH_SIZE         =      5_000;
+    private static final int  DB_BATCH_SIZE         =    10_000;
 
-    private static final int NUM_CONTACTS          =     50_000;
-    private static final int NUM_CONVERSATIONS     =    100_000;
+    private static final int  NUM_CONTACTS          =    50_000;
+    private static final int  NUM_CONVERSATIONS     =   100_000;
 
     private static final long ORG_ID     = 1L;
     private static final long PROJECT_ID = 1L;
     private static final long WABA_ID    = 1L;
 
     // ══════════════════════════════════════════════════════════════════════
-    //  SQL TEMPLATES (shared across threads — read-only)
+    //  SQL (shared read-only — safe across threads)
     // ══════════════════════════════════════════════════════════════════════
 
     private static final String MSG_SQL = """
@@ -110,7 +120,7 @@ public class DataSeeder implements CommandLineRunner {
             """;
 
     // ══════════════════════════════════════════════════════════════════════
-    //  RANDOM DATA POOLS  (immutable → safe to share across threads)
+    //  RANDOM DATA POOLS  (immutable — safe to share across threads)
     // ══════════════════════════════════════════════════════════════════════
 
     private static final String[] FIRST_NAMES = {
@@ -148,8 +158,8 @@ public class DataSeeder implements CommandLineRunner {
     private static final String[] SOURCES = {"MANUAL","IMPORT","INTEGRATION","INBOUND"};
 
     /**
-     * Detected dynamically from DB; set once in initEnumValues() before any thread starts.
-     * Threads read it but never write — safe without synchronization.
+     * Detected from DB ENUM definition at startup.
+     * Volatile — written once before threads start, read-only after.
      */
     private volatile String[] MSG_TYPES;
 
@@ -163,6 +173,7 @@ public class DataSeeder implements CommandLineRunner {
         if (!argList.contains("--seed")) return;
 
         initEnumValues();
+        verifyBatchRewriteEnabled();
 
         boolean quick        = argList.contains("--quick");
         boolean messagesOnly = argList.contains("--messages-only");
@@ -178,12 +189,33 @@ public class DataSeeder implements CommandLineRunner {
                 runFullSeed(totalTarget);
             }
         } catch (Exception e) {
-            log.error("❌ Seeder failed: {}", e.getMessage(), e);
+            log.error("Seeder failed: {}", e.getMessage(), e);
         }
 
         printSummary(globalStart);
         SpringApplication.exit(ctx, () -> 0);
         System.exit(0);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    //  VERIFY BATCH REWRITE IS ON
+    // ══════════════════════════════════════════════════════════════════════
+
+    private void verifyBatchRewriteEnabled() {
+        try (Connection conn = dataSource.getConnection()) {
+            String url = conn.getMetaData().getURL();
+            if (!url.contains("rewriteBatchedStatements=true")) {
+                log.warn("╔══════════════════════════════════════════════════════════╗");
+                log.warn("║  WARNING: rewriteBatchedStatements=true NOT in JDBC URL  ║");
+                log.warn("║  Seeder will run 50-100x SLOWER than expected.           ║");
+                log.warn("║  Add to datasource.url in application.yaml and restart.  ║");
+                log.warn("╚══════════════════════════════════════════════════════════╝");
+            } else {
+                log.info("  [OK] rewriteBatchedStatements=true confirmed in JDBC URL");
+            }
+        } catch (Exception e) {
+            log.warn("  Could not verify JDBC URL: {}", e.getMessage());
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -193,10 +225,10 @@ public class DataSeeder implements CommandLineRunner {
     private void runFullSeed(int totalMessages) {
         seedTemplates();
         List<Long> contactIds = seedContacts();
-        if (contactIds.isEmpty()) { log.error("❌ No contacts seeded. Aborting."); return; }
+        if (contactIds.isEmpty()) { log.error("No contacts seeded. Aborting."); return; }
 
         List<Long> convIds = seedConversations(contactIds);
-        if (convIds.isEmpty()) { log.error("❌ No conversations seeded. Aborting."); return; }
+        if (convIds.isEmpty()) { log.error("No conversations seeded. Aborting."); return; }
 
         seedMessagesParallel(convIds, totalMessages);
     }
@@ -206,52 +238,61 @@ public class DataSeeder implements CommandLineRunner {
     // ══════════════════════════════════════════════════════════════════════
 
     private void runMessagesOnly(int totalMessages) {
-        log.info("━━━ Loading existing conversation IDs from DB...");
+        log.info("Loading existing conversation IDs from DB...");
         List<Long> convIds = jdbc.queryForList(
                 "SELECT id FROM conversations WHERE project_id = ?", Long.class, PROJECT_ID);
 
         if (convIds.isEmpty()) {
-            log.error("❌ No conversations found for project_id={}. Run full seed first.", PROJECT_ID);
+            log.error("No conversations found for project_id={}. Run full seed first.", PROJECT_ID);
             return;
         }
 
         Long existing = jdbc.queryForObject(
                 "SELECT COUNT(*) FROM messages WHERE project_id = ?", Long.class, PROJECT_ID);
-        log.info("  ✓ Found {} existing conversations", fmt(convIds.size()));
-        log.info("  ℹ Existing messages: {}", fmt(existing != null ? existing : 0));
-        log.info("  ℹ Inserting {} more messages across {} threads", fmt(totalMessages), NUM_THREADS);
+        log.info("  Found {} existing conversations", fmt(convIds.size()));
+        log.info("  Existing messages in DB: {}", fmt(existing != null ? existing : 0));
+        log.info("  Inserting {} NEW messages across {} threads", fmt(totalMessages), NUM_THREADS);
+        log.info("  After completion: ~{} total messages",
+                fmt((existing != null ? existing : 0) + totalMessages));
 
         seedMessagesParallel(convIds, totalMessages);
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    //  PARALLEL MESSAGE SEEDING  ← main entry for threaded work
+    //  PARALLEL MESSAGE SEEDING
     // ══════════════════════════════════════════════════════════════════════
 
     private void seedMessagesParallel(List<Long> convIds, int totalMessages) {
         if (convIds == null || convIds.isEmpty()) {
-            log.error("❌ convIds is empty — cannot seed messages.");
+            log.error("convIds is empty — cannot seed messages.");
             return;
         }
 
-        // Pre-load contact map once; all threads share it read-only.
         Map<Long, Long> convContactMap = loadConvContactMap();
 
+        // Thread work distribution
+        // Example: 10_000_000 / 8 = 1_250_000 per thread
+        // lastThreadEx = 10_000_000 - 1_250_000 * 7 = 1_250_000
+        // Total = 7 * 1_250_000 + 1_250_000 = 10_000_000 ✓
         int perThread    = totalMessages / NUM_THREADS;
-        int lastThreadEx = totalMessages - perThread * (NUM_THREADS - 1); // handles remainder
+        int lastThreadEx = totalMessages - perThread * (NUM_THREADS - 1);
 
         log.info("");
-        log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        log.info("  Threads       : {}", NUM_THREADS);
-        log.info("  Target total  : {}", fmt(totalMessages));
-        log.info("  Per thread    : {} (last thread: {})", fmt(perThread), fmt(lastThreadEx));
-        log.info("  DB batch size : {}", fmt(DB_BATCH_SIZE));
-        log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        log.info("  Threads            : {}", NUM_THREADS);
+        log.info("  Target total       : {}", fmt(totalMessages));
+        log.info("  Per thread (T1-T{}) : {}", NUM_THREADS - 1, fmt(perThread));
+        log.info("  Last thread (T{})   : {}", NUM_THREADS, fmt(lastThreadEx));
+        log.info("  Total check        : {} ({})",
+                fmt((long) perThread * (NUM_THREADS - 1) + lastThreadEx),
+                ((long) perThread * (NUM_THREADS - 1) + lastThreadEx == totalMessages) ? "OK" : "MISMATCH!");
+        log.info("  DB batch size      : {} rows -> 1 multi-row INSERT", fmt(DB_BATCH_SIZE));
+        log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
         AtomicLong globalInserted = new AtomicLong(0);
-        long globalStart          = System.currentTimeMillis();
+        long       globalStart    = System.currentTimeMillis();
 
-        // ── Progress monitor (logs every 10 s) ───────────────────────────
+        // Progress monitor every 5 seconds
         ScheduledExecutorService monitor = Executors.newSingleThreadScheduledExecutor(
                 r -> { Thread t = new Thread(r, "seeder-monitor"); t.setDaemon(true); return t; }
         );
@@ -261,29 +302,28 @@ public class DataSeeder implements CommandLineRunner {
             double sec = (System.currentTimeMillis() - globalStart) / 1000.0;
             double rps = sec > 0 ? ins / sec : 0;
             double eta = rps > 0 ? (totalMessages - ins) / rps : 0;
-            log.info("  📊 {}/{} ({}) | {} rows/s | ETA: {}",
+            log.info("  [MONITOR] {}/{} ({}) | {}/s | ETA: {}",
                     fmt(ins), fmt(totalMessages),
                     String.format("%.1f%%", pct),
-                    String.format("%.0f", rps),
+                    String.format("%,.0f", rps),
                     formatEta((long) eta));
-        }, 10, 10, TimeUnit.SECONDS);
+        }, 5, 5, TimeUnit.SECONDS);
 
-        // ── Submit workers ────────────────────────────────────────────────
+        // Submit workers
         ExecutorService pool = Executors.newFixedThreadPool(NUM_THREADS,
-                r -> { Thread t = new Thread(r, "seeder-worker-" + r.hashCode()); return t; });
+                r -> new Thread(r, "seeder-worker-" + r.hashCode()));
 
         List<Callable<Map<Long, Long>>> tasks = new ArrayList<>();
         for (int t = 0; t < NUM_THREADS; t++) {
             final int threadId     = t + 1;
             final int threadTarget = (t == NUM_THREADS - 1) ? lastThreadEx : perThread;
-
             tasks.add(() -> insertWorker(
                     threadId, convIds, convContactMap, threadTarget, globalInserted));
         }
 
         List<Future<Map<Long, Long>>> futures;
         try {
-            futures = pool.invokeAll(tasks);   // blocks until all workers finish
+            futures = pool.invokeAll(tasks);   // blocks until ALL workers finish
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             log.error("Seeder interrupted: {}", e.getMessage());
@@ -295,13 +335,13 @@ public class DataSeeder implements CommandLineRunner {
             monitor.shutdownNow();
         }
 
-        // ── Merge lastMsgPerConv from all workers ─────────────────────────
+        // Merge lastMsgPerConv from all workers
         Map<Long, Long> globalLastMsg = new HashMap<>();
         int workersFailed = 0;
         for (int i = 0; i < futures.size(); i++) {
             try {
-                futures.get(i).get().forEach((convId, msgId) ->
-                        globalLastMsg.merge(convId, msgId, Math::max));
+                futures.get(i).get().forEach((cId, mId) ->
+                        globalLastMsg.merge(cId, mId, Math::max));
             } catch (Exception e) {
                 workersFailed++;
                 log.error("Worker {} threw exception: {}", i + 1, e.getMessage(), e);
@@ -310,27 +350,38 @@ public class DataSeeder implements CommandLineRunner {
 
         long elapsed = (System.currentTimeMillis() - globalStart) / 1000;
         log.info("");
-        log.info("━━━ All {} threads done in {} | Total inserted: {} | Workers failed: {}",
+        log.info("All {} threads done in {} | Total inserted: {} | Workers failed: {}",
                 NUM_THREADS, formatEta(elapsed), fmt(globalInserted.get()), workersFailed);
+
+        if (globalInserted.get() != totalMessages) {
+            log.warn("  Expected {} but inserted {} — check worker errors above.",
+                    fmt(totalMessages), fmt(globalInserted.get()));
+        } else {
+            log.info("  Inserted exactly {} rows.", fmt(globalInserted.get()));
+        }
 
         backfillLastMessageId(globalLastMsg);
         verifyInsertedData();
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    //  WORKER — runs on its own thread with a dedicated JDBC connection
+    //  WORKER — dedicated JDBC connection per thread
     // ══════════════════════════════════════════════════════════════════════
 
     /**
      * Each worker:
-     *  1. Borrows ONE connection from the pool for its entire run.
-     *  2. Disables FK + unique checks on that connection (session-scoped).
+     *  1. Gets ONE connection from pool for its entire run.
+     *  2. Sets SESSION-scoped variables only (safe without SUPER privilege):
+     *       foreign_key_checks=0   — skip FK validation during bulk load
+     *       unique_checks=0        — skip secondary unique index maintenance
+     *     NOTE: innodb_flush_log_at_trx_commit and sync_binlog are GLOBAL-only
+     *     in MySQL 8.0 and cannot be set per-session. Do NOT add them here.
      *  3. Inserts messages in DB_BATCH_SIZE batches.
-     *  4. Retrieves generated IDs via RETURN_GENERATED_KEYS (no MAX(id) race).
-     *  5. Inserts rollup rows using those exact IDs.
-     *  6. Re-enables FK + unique checks before returning the connection.
-     *
-     * @return map of conversationId → highest messageId inserted by this worker
+     *     With rewriteBatchedStatements=true, each executeBatch() sends ONE
+     *     multi-row INSERT ... VALUES (...),(...),...  instead of N single INSERTs.
+     *  4. Collects generated PKs via RETURN_GENERATED_KEYS (no MAX(id) race).
+     *  5. Inserts rollup rows with exact PKs.
+     *  6. Re-enables SESSION variables before releasing connection.
      */
     private Map<Long, Long> insertWorker(
             int             threadId,
@@ -340,16 +391,18 @@ public class DataSeeder implements CommandLineRunner {
             AtomicLong      globalInserted
     ) {
         Map<Long, Long> lastMsgPerConv = new HashMap<>();
-        // Each thread has its own Random — ThreadLocalRandom would also work
-        Random rng = new Random();
+        Random          rng            = new Random();
 
-        log.info("  [T{}] Starting — target: {} messages", threadId, fmt(targetCount));
+        log.info("  [T{}] Starting — target: {} messages | batch: {}",
+                threadId, fmt(targetCount), fmt(DB_BATCH_SIZE));
         long threadStart = System.currentTimeMillis();
 
         try (Connection conn = dataSource.getConnection()) {
-            conn.setAutoCommit(true);   // auto-commit per executeBatch() call
+            conn.setAutoCommit(true);
 
-            // ── Disable FK + unique checks for this session ───────────────
+            // SESSION-scoped only — safe in MySQL 8 without SUPER privilege
+            // DO NOT add innodb_flush_log_at_trx_commit or sync_binlog here —
+            // they are GLOBAL variables in MySQL 8.0 and will throw an error.
             try (Statement st = conn.createStatement()) {
                 st.execute("SET foreign_key_checks=0");
                 st.execute("SET unique_checks=0");
@@ -357,7 +410,7 @@ public class DataSeeder implements CommandLineRunner {
 
             List<Object[]> msgBatch    = new ArrayList<>(DB_BATCH_SIZE);
             List<Object[]> rollupCache = new ArrayList<>(DB_BATCH_SIZE);
-            int localInserted          = 0;
+            int            localCount  = 0;
 
             for (int i = 0; i < targetCount; i++) {
                 long convId    = pickFromList(convIds, rng);
@@ -369,11 +422,11 @@ public class DataSeeder implements CommandLineRunner {
                 String    byType    = pickFromArray(BY_TYPES, rng);
                 Timestamp ca        = randomTimestamp(rng);
 
-                boolean isTmpl  = "TEMPLATE".equals(msgType);
-                boolean isSent  = status.equals("SENT")      || status.equals("DELIVERED") || status.equals("READ");
-                boolean isDel   = status.equals("DELIVERED") || status.equals("READ");
-                boolean isRead  = status.equals("READ");
-                boolean isFail  = status.equals("FAILED");
+                boolean isTmpl = "TEMPLATE".equals(msgType);
+                boolean isSent = status.equals("SENT")      || status.equals("DELIVERED") || status.equals("READ");
+                boolean isDel  = status.equals("DELIVERED") || status.equals("READ");
+                boolean isRead = status.equals("READ");
+                boolean isFail = status.equals("FAILED");
 
                 Timestamp sentAt      = isSent ? plusSeconds(ca, rng.nextInt(30)  + 1)   : null;
                 Timestamp deliveredAt = isDel  ? plusSeconds(ca, rng.nextInt(90)  + 30)  : null;
@@ -381,86 +434,81 @@ public class DataSeeder implements CommandLineRunner {
                 Timestamp now         = Timestamp.from(Instant.now());
 
                 msgBatch.add(new Object[]{
-                        UUID.randomUUID().toString(),     // 1  uuid
-                        ORG_ID,                           // 2  organization_id
-                        PROJECT_ID,                       // 3  project_id
-                        convId,                           // 4  conversation_id
-                        WABA_ID,                          // 5  waba_account_id
-                        contactId,                        // 6  contact_id
-                        direction,                        // 7  direction
-                        msgType,                          // 8  message_type
-                        isTmpl ? pickFromArray(TEMPLATE_NAMES, rng) : null,  // 9  template_name
-                        isTmpl ? "en" : null,             // 10 template_language
-                        isTmpl ? randomTemplateVars(rng) : null,             // 11 template_vars
-                        "TEXT".equals(msgType) ? randSentence(rng) : null,   // 12 body_text
-                        "wamid." + shortUuid(rng),        // 13 provider_message_id
-                        status,                           // 14 status
-                        byType,                           // 15 created_by_type
-                        "USER".equals(byType) ? (long)(rng.nextInt(100) + 1) : null, // 16 created_by_id
-                        ca,                               // 17 created_at
-                        sentAt,                           // 18 sent_at
-                        deliveredAt,                      // 19 delivered_at
-                        readAt                            // 20 read_at
+                        UUID.randomUUID().toString(),
+                        ORG_ID, PROJECT_ID, convId, WABA_ID, contactId,
+                        direction, msgType,
+                        isTmpl ? pickFromArray(TEMPLATE_NAMES, rng) : null,
+                        isTmpl ? "en" : null,
+                        isTmpl ? randomTemplateVars(rng) : null,
+                        "TEXT".equals(msgType) ? randSentence(rng) : null,
+                        "wamid." + shortUuid(rng),
+                        status, byType,
+                        "USER".equals(byType) ? (long)(rng.nextInt(100) + 1) : null,
+                        ca, sentAt, deliveredAt, readAt
                 });
 
-                // Store rollup flags; message_id filled after INSERT returns generated keys
                 rollupCache.add(new Object[]{
-                        isSent ? 1 : 0,   // is_sent
-                        isDel  ? 1 : 0,   // is_delivered
-                        isRead ? 1 : 0,   // is_read
-                        isFail ? 1 : 0,   // is_failed
-                        now               // last_updated_at
+                        isSent ? 1 : 0,
+                        isDel  ? 1 : 0,
+                        isRead ? 1 : 0,
+                        isFail ? 1 : 0,
+                        now
                 });
 
                 if (msgBatch.size() >= DB_BATCH_SIZE) {
-                    int flushed = flushBatchOnConnection(conn, msgBatch, rollupCache, lastMsgPerConv);
-                    localInserted += flushed;
+                    int flushed = flushBatch(conn, msgBatch, rollupCache, lastMsgPerConv);
+                    localCount += flushed;
                     globalInserted.addAndGet(flushed);
                     msgBatch.clear();
                     rollupCache.clear();
 
                     // Sub-progress every 10 batches
-                    if ((localInserted / DB_BATCH_SIZE) % 10 == 0) {
-                        log.info("  [T{}] {}/{}", threadId, fmt(localInserted), fmt(targetCount));
+                    if ((localCount / DB_BATCH_SIZE) % 10 == 0) {
+                        log.info("  [T{}] {}/{} ({}%)",
+                                threadId, fmt(localCount), fmt(targetCount),
+                                String.format("%.1f", localCount * 100.0 / targetCount));
                     }
                 }
             }
 
             // Flush tail batch
             if (!msgBatch.isEmpty()) {
-                int flushed = flushBatchOnConnection(conn, msgBatch, rollupCache, lastMsgPerConv);
-                localInserted += flushed;
+                int flushed = flushBatch(conn, msgBatch, rollupCache, lastMsgPerConv);
+                localCount += flushed;
                 globalInserted.addAndGet(flushed);
             }
 
-            // ── Re-enable FK + unique checks ──────────────────────────────
+            // Restore session variables
             try (Statement st = conn.createStatement()) {
                 st.execute("SET foreign_key_checks=1");
                 st.execute("SET unique_checks=1");
             }
 
             double sec = (System.currentTimeMillis() - threadStart) / 1000.0;
-            log.info("  [T{}] ✓ Finished {} messages in {}s ({} rows/s)",
-                    threadId, fmt(localInserted),
+            log.info("  [T{}] DONE — {} messages in {}s ({}/s)",
+                    threadId, fmt(localCount),
                     String.format("%.1f", sec),
-                    String.format("%.0f", localInserted / sec));
+                    String.format("%,.0f", localCount / sec));
+
+            if (localCount != targetCount) {
+                log.warn("  [T{}] Expected {} but inserted {} rows!",
+                        threadId, fmt(targetCount), fmt(localCount));
+            }
 
         } catch (SQLException e) {
-            log.error("  [T{}] ❌ JDBC error: {}", threadId, e.getMessage(), e);
+            log.error("  [T{}] JDBC error: {}", threadId, e.getMessage(), e);
         }
 
         return lastMsgPerConv;
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    //  FLUSH ONE BATCH ON A GIVEN CONNECTION
-    //  Uses RETURN_GENERATED_KEYS — no SELECT MAX(id) race condition.
+    //  FLUSH ONE BATCH
+    //  With rewriteBatchedStatements=true in the JDBC URL, executeBatch()
+    //  sends a SINGLE multi-row INSERT instead of N individual statements.
     // ══════════════════════════════════════════════════════════════════════
 
-    /**
-     * @return number of message rows actually inserted
-     */
-    private int flushBatchOnConnection(
+    private int flushBatch(
             Connection      conn,
             List<Object[]>  msgBatch,
             List<Object[]>  rollupCache,
@@ -469,7 +517,7 @@ public class DataSeeder implements CommandLineRunner {
 
         List<Long> generatedIds = new ArrayList<>(msgBatch.size());
 
-        // ── Insert messages + collect generated PKs ───────────────────────
+        // Insert messages, collect auto-increment PKs
         try (PreparedStatement ps =
                      conn.prepareStatement(MSG_SQL, Statement.RETURN_GENERATED_KEYS)) {
 
@@ -499,31 +547,28 @@ public class DataSeeder implements CommandLineRunner {
 
             ps.executeBatch();
 
-            // Collect actual auto-increment IDs assigned by MySQL
             try (ResultSet rs = ps.getGeneratedKeys()) {
-                while (rs.next()) {
-                    generatedIds.add(rs.getLong(1));
-                }
+                while (rs.next()) generatedIds.add(rs.getLong(1));
             }
         }
 
-        // ── Update lastMsgPerConv ─────────────────────────────────────────
+        // Track highest message ID per conversation
         for (int j = 0; j < generatedIds.size() && j < msgBatch.size(); j++) {
             long msgId  = generatedIds.get(j);
-            long convId = ((Number) msgBatch.get(j)[3]).longValue();   // conversation_id at index 3
+            long convId = ((Number) msgBatch.get(j)[3]).longValue();
             lastMsgPerConv.merge(convId, msgId, Math::max);
         }
 
-        // ── Insert rollup rows with exact message IDs ─────────────────────
+        // Insert rollup rows with exact PKs
         try (PreparedStatement rps = conn.prepareStatement(ROLLUP_SQL)) {
             for (int j = 0; j < generatedIds.size() && j < rollupCache.size(); j++) {
                 Object[] r = rollupCache.get(j);
-                rps.setLong(1,   generatedIds.get(j));  // message_id
-                rps.setObject(2, r[0]);                  // is_sent
-                rps.setObject(3, r[1]);                  // is_delivered
-                rps.setObject(4, r[2]);                  // is_read
-                rps.setObject(5, r[3]);                  // is_failed
-                rps.setObject(6, r[4]);                  // last_updated_at
+                rps.setLong(1,   generatedIds.get(j));
+                rps.setObject(2, r[0]);   // is_sent
+                rps.setObject(3, r[1]);   // is_delivered
+                rps.setObject(4, r[2]);   // is_read
+                rps.setObject(5, r[3]);   // is_failed
+                rps.setObject(6, r[4]);   // last_updated_at
                 rps.addBatch();
             }
             rps.executeBatch();
@@ -533,14 +578,15 @@ public class DataSeeder implements CommandLineRunner {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    //  BACKFILL last_message_id
+    //  BACKFILL last_message_id on conversations
     // ══════════════════════════════════════════════════════════════════════
 
     private void backfillLastMessageId(Map<Long, Long> lastMsgPerConv) {
         if (lastMsgPerConv.isEmpty()) return;
 
-        log.info("  Backfilling last_message_id for {} conversations...", fmt(lastMsgPerConv.size()));
-        String sql = "UPDATE conversations SET last_message_id=?, updated_at=NOW() WHERE id=?";
+        log.info("  Backfilling last_message_id for {} conversations...",
+                fmt(lastMsgPerConv.size()));
+        String         sql   = "UPDATE conversations SET last_message_id=?, updated_at=NOW() WHERE id=?";
         List<Object[]> batch = new ArrayList<>(DB_BATCH_SIZE);
 
         for (Map.Entry<Long, Long> e : lastMsgPerConv.entrySet()) {
@@ -551,8 +597,7 @@ public class DataSeeder implements CommandLineRunner {
             }
         }
         if (!batch.isEmpty()) jdbc.batchUpdate(sql, batch);
-
-        log.info("  ✓ Backfill done");
+        log.info("  Backfill done.");
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -577,14 +622,13 @@ public class DataSeeder implements CommandLineRunner {
                   (organization_id, project_id, waba_account_id, name, category,
                    language, status, created_by, created_at, updated_at)
                 VALUES (?,?,?,?,?,?,'APPROVED',1,?,?)
-                """,
-                    ORG_ID, PROJECT_ID, String.valueOf(WABA_ID), t[0], t[1], t[2], ca, ca);
+                """, ORG_ID, PROJECT_ID, String.valueOf(WABA_ID), t[0], t[1], t[2], ca, ca);
 
             Long tid = jdbc.queryForObject(
                     "SELECT id FROM whatsapp_templates WHERE name=? AND project_id=?",
                     Long.class, t[0], PROJECT_ID);
-
             if (tid == null) continue;
+
             jdbc.update("""
                 INSERT IGNORE INTO whatsapp_template_components
                   (template_id, component_type, format, text, component_order, created_at)
@@ -612,7 +656,6 @@ public class DataSeeder implements CommandLineRunner {
             Long tid = jdbc.queryForObject(
                     "SELECT id FROM whatsapp_templates WHERE name=? AND project_id=?",
                     Long.class, name, PROJECT_ID);
-
             if (tid != null) {
                 jdbc.update("""
                     INSERT IGNORE INTO whatsapp_template_components
@@ -621,8 +664,7 @@ public class DataSeeder implements CommandLineRunner {
                     """, tid, "Hello {{1}}, update regarding " + name + ".", ca);
             }
         }
-
-        log.info("  ✓ Templates seeded");
+        log.info("  Templates seeded.");
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -640,8 +682,7 @@ public class DataSeeder implements CommandLineRunner {
 
         log.info("━━━ [2/4] Seeding {} contacts...", fmt(NUM_CONTACTS));
         Random rng = new Random();
-        long t0 = System.currentTimeMillis();
-
+        long   t0  = System.currentTimeMillis();
         String sql = """
             INSERT IGNORE INTO contacts
               (organization_id, wa_phone_e164, wa_id, display_name, source,
@@ -664,8 +705,8 @@ public class DataSeeder implements CommandLineRunner {
 
         List<Long> ids = jdbc.queryForList(
                 "SELECT id FROM contacts WHERE organization_id=?", Long.class, ORG_ID);
-        log.info("  ✓ {} contacts ready ({}s)",
-                fmt(ids.size()), String.format("%.1f", (System.currentTimeMillis()-t0)/1000.0));
+        log.info("  {} contacts ready ({}s)", fmt(ids.size()),
+                String.format("%.1f", (System.currentTimeMillis() - t0) / 1000.0));
         return ids;
     }
 
@@ -675,7 +716,7 @@ public class DataSeeder implements CommandLineRunner {
 
     private List<Long> seedConversations(List<Long> contactIds) {
         if (contactIds == null || contactIds.isEmpty()) {
-            log.error("❌ contactIds is empty — cannot seed conversations.");
+            log.error("contactIds is empty — cannot seed conversations.");
             return Collections.emptyList();
         }
 
@@ -689,8 +730,7 @@ public class DataSeeder implements CommandLineRunner {
 
         log.info("━━━ [3/4] Seeding {} conversations...", fmt(NUM_CONVERSATIONS));
         Random rng = new Random();
-        long t0 = System.currentTimeMillis();
-
+        long   t0  = System.currentTimeMillis();
         String sql = """
             INSERT IGNORE INTO conversations
               (organization_id, project_id, waba_account_id, contact_id,
@@ -707,14 +747,14 @@ public class DataSeeder implements CommandLineRunner {
             long      contactId  = pickFromList(contactIds, rng);
             String    status     = pickFromArray(STATUSES, rng);
             String    assignType = pickFromArray(ASSIGNED_TYPES, rng);
-            Long      assignId   = "UNASSIGNED".equals(assignType) ? null : (long)(rng.nextInt(50)+1);
+            Long      assignId   = "UNASSIGNED".equals(assignType) ? null : (long)(rng.nextInt(50) + 1);
             Timestamp lastMsg    = daysAgo(0, 180);
             String    direction  = pickFromArray(DIRECTIONS, rng);
             int       unread     = "OPEN".equals(status) ? rng.nextInt(25) : 0;
             Timestamp openUntil  = "INBOUND".equals(direction)
                     ? Timestamp.from(lastMsg.toInstant().plus(24, ChronoUnit.HOURS)) : null;
             Timestamp createdAt  = Timestamp.from(
-                    lastMsg.toInstant().minus(rng.nextInt(60)+1, ChronoUnit.DAYS));
+                    lastMsg.toInstant().minus(rng.nextInt(60) + 1, ChronoUnit.DAYS));
 
             batch.add(new Object[]{
                     ORG_ID, PROJECT_ID, WABA_ID, contactId,
@@ -731,8 +771,8 @@ public class DataSeeder implements CommandLineRunner {
 
         List<Long> ids = jdbc.queryForList(
                 "SELECT id FROM conversations WHERE project_id=?", Long.class, PROJECT_ID);
-        log.info("  ✓ {} conversations ready ({}s)",
-                fmt(ids.size()), String.format("%.1f", (System.currentTimeMillis()-t0)/1000.0));
+        log.info("  {} conversations ready ({}s)", fmt(ids.size()),
+                String.format("%.1f", (System.currentTimeMillis() - t0) / 1000.0));
         return ids;
     }
 
@@ -750,7 +790,8 @@ public class DataSeeder implements CommandLineRunner {
             if (enumDef != null && enumDef.toLowerCase().startsWith("enum(")) {
                 String inner = enumDef.substring(5, enumDef.length() - 1);
                 Set<String> valid = new LinkedHashSet<>();
-                for (String token : inner.split(",")) valid.add(token.replace("'","").trim().toUpperCase());
+                for (String token : inner.split(","))
+                    valid.add(token.replace("'", "").trim().toUpperCase());
 
                 List<String> weighted = new ArrayList<>();
                 String[] preferred = {
@@ -766,7 +807,7 @@ public class DataSeeder implements CommandLineRunner {
                 MSG_TYPES = new String[]{"TEXT"};
             }
         } catch (Exception e) {
-            log.warn("  Could not detect message_type ENUM ({}). Fallback: TEXT only.", e.getMessage());
+            log.warn("  Could not detect message_type ENUM: {}. Using TEXT only.", e.getMessage());
             MSG_TYPES = new String[]{"TEXT"};
         }
     }
@@ -777,58 +818,60 @@ public class DataSeeder implements CommandLineRunner {
 
     private void verifyInsertedData() {
         log.info("");
-        log.info("━━━ POST-SEED VERIFICATION ─────────────────────────────────");
+        log.info("━━━ POST-SEED VERIFICATION ──────────────────────────────────────");
         try {
-            log.info("  contacts              : {}", fmt(safe(() -> jdbc.queryForObject("SELECT COUNT(*) FROM contacts",                    Long.class))));
-            log.info("  conversations (total) : {}", fmt(safe(() -> jdbc.queryForObject("SELECT COUNT(*) FROM conversations",               Long.class))));
-            log.info("  conversations (OPEN)  : {}", fmt(safe(() -> jdbc.queryForObject("SELECT COUNT(*) FROM conversations WHERE status='OPEN'", Long.class))));
-            log.info("  messages (total)      : {}", fmt(safe(() -> jdbc.queryForObject("SELECT COUNT(*) FROM messages",                   Long.class))));
-            log.info("  messages TEXT         : {}", fmt(safe(() -> jdbc.queryForObject("SELECT COUNT(*) FROM messages WHERE message_type='TEXT'",     Long.class))));
-            log.info("  messages TEMPLATE     : {}", fmt(safe(() -> jdbc.queryForObject("SELECT COUNT(*) FROM messages WHERE message_type='TEMPLATE'", Long.class))));
-            log.info("  message_status_rollup : {}", fmt(safe(() -> jdbc.queryForObject("SELECT COUNT(*) FROM message_status_rollup",      Long.class))));
-            log.info("  whatsapp_templates    : {}", fmt(safe(() -> jdbc.queryForObject("SELECT COUNT(*) FROM whatsapp_templates",         Long.class))));
-
             long msgs   = safe(() -> jdbc.queryForObject("SELECT COUNT(*) FROM messages", Long.class));
             long rollup = safe(() -> jdbc.queryForObject("SELECT COUNT(*) FROM message_status_rollup", Long.class));
+
+            log.info("  contacts              : {}", fmt(safe(() -> jdbc.queryForObject("SELECT COUNT(*) FROM contacts", Long.class))));
+            log.info("  conversations (total) : {}", fmt(safe(() -> jdbc.queryForObject("SELECT COUNT(*) FROM conversations", Long.class))));
+            log.info("  conversations (OPEN)  : {}", fmt(safe(() -> jdbc.queryForObject("SELECT COUNT(*) FROM conversations WHERE status='OPEN'", Long.class))));
+            log.info("  messages (total)      : {}", fmt(msgs));
+            log.info("  messages TEXT         : {}", fmt(safe(() -> jdbc.queryForObject("SELECT COUNT(*) FROM messages WHERE message_type='TEXT'", Long.class))));
+            log.info("  messages TEMPLATE     : {}", fmt(safe(() -> jdbc.queryForObject("SELECT COUNT(*) FROM messages WHERE message_type='TEMPLATE'", Long.class))));
+            log.info("  message_status_rollup : {}", fmt(rollup));
+            log.info("  whatsapp_templates    : {}", fmt(safe(() -> jdbc.queryForObject("SELECT COUNT(*) FROM whatsapp_templates", Long.class))));
+
             if (msgs != rollup)
-                log.warn("  ⚠ messages ({}) != rollup ({}) — rollup rows may be missing", fmt(msgs), fmt(rollup));
+                log.warn("  messages ({}) != rollup ({}) — some rollup rows missing!", fmt(msgs), fmt(rollup));
             else
-                log.info("  ✓ messages == rollup — counts match perfectly");
+                log.info("  messages == rollup ({}) — counts match perfectly", fmt(msgs));
+
         } catch (Exception e) {
-            log.warn("  Could not complete verification: {}", e.getMessage());
+            log.warn("  Verification error: {}", e.getMessage());
         }
-        log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    //  LOAD CONVERSATION → CONTACT MAP
+    //  LOAD CONVERSATION -> CONTACT MAP
     // ══════════════════════════════════════════════════════════════════════
 
     private Map<Long, Long> loadConvContactMap() {
-        log.info("  Loading conversation→contact map...");
+        log.info("  Loading conversation->contact map...");
         Map<Long, Long> map = new HashMap<>();
         jdbc.query("SELECT id, contact_id FROM conversations WHERE project_id=?",
                 ps -> ps.setLong(1, PROJECT_ID),
                 (RowCallbackHandler) rs -> map.put(rs.getLong("id"), rs.getLong("contact_id")));
-        log.info("  ✓ Loaded {} conversation entries", fmt(map.size()));
+        log.info("  Loaded {} conversation entries.", fmt(map.size()));
         return map;
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    //  HELPERS  — each takes its own Random so threads don't share state
+    //  HELPERS
     // ══════════════════════════════════════════════════════════════════════
 
-    /** daysAgo helper uses main-thread Random (only called before threads start) */
     private Timestamp daysAgo(int minDays, int maxDays) {
         if (maxDays <= minDays) maxDays = minDays + 1;
-        long ms = ((long)(new Random().nextInt((maxDays-minDays)*86400)) + (long)(minDays*86400L))*1000L;
+        long ms = ((long)(new Random().nextInt((maxDays - minDays) * 86400))
+                + (long)(minDays * 86400L)) * 1000L;
         return Timestamp.from(Instant.now().minusMillis(ms));
     }
 
     private Timestamp randomTimestamp(Random rng) {
         int maxDays = rng.nextInt(100) < 70 ? 90 : 365;
         int maxSec  = maxDays * 86400;
-        return Timestamp.from(Instant.now().minusMillis((long)rng.nextInt(maxSec) * 1000L));
+        return Timestamp.from(Instant.now().minusMillis((long) rng.nextInt(maxSec) * 1000L));
     }
 
     private Timestamp plusSeconds(Timestamp base, int seconds) {
@@ -841,8 +884,7 @@ public class DataSeeder implements CommandLineRunner {
     }
 
     private long pickFromList(List<Long> list, Random rng) {
-        if (list == null || list.isEmpty())
-            throw new IllegalStateException("Cannot pick from empty list");
+        if (list == null || list.isEmpty()) throw new IllegalStateException("Empty list");
         return list.get(rng.nextInt(list.size()));
     }
 
@@ -857,7 +899,7 @@ public class DataSeeder implements CommandLineRunner {
     }
 
     private String shortUuid(Random rng) {
-        return UUID.randomUUID().toString().replace("-","").substring(0, 24);
+        return UUID.randomUUID().toString().replace("-", "").substring(0, 24);
     }
 
     private String randomTemplateVars(Random rng) {
@@ -865,33 +907,30 @@ public class DataSeeder implements CommandLineRunner {
         String[] orders  = {"ORD-1234","ORD-5678","ORD-9012","ORD-3456","INV-7890"};
         String[] dates   = {"Tomorrow","Today","In 2 days","This Friday","Monday"};
         String[] amounts = {"INR500","INR1200","INR2500","INR499","INR999"};
-
         return switch (rng.nextInt(4)) {
             case 0 -> String.format("{\"body\":[[\"%s\",\"%s\",\"%s\"]]}",
-                    pickFromArray(names,rng), pickFromArray(orders,rng), pickFromArray(dates,rng));
+                    pickFromArray(names, rng), pickFromArray(orders, rng), pickFromArray(dates, rng));
             case 1 -> String.format("{\"body\":[[\"%s\",\"%s\"]]}",
-                    pickFromArray(names,rng), pickFromArray(amounts,rng));
-            case 2 -> String.format("{\"body\":[[\"%s\"]]}", pickFromArray(names,rng));
+                    pickFromArray(names, rng), pickFromArray(amounts, rng));
+            case 2 -> String.format("{\"body\":[[\"%s\"]]}", pickFromArray(names, rng));
             default -> "{\"body\":[[\"Customer\",\"ORD-0000\",\"Soon\"]]}";
         };
     }
 
-    private String fmt(long n) { return String.format("%,d", n); }
-
-    private String formatEta(long seconds) {
-        if (seconds < 60)   return seconds + "s";
-        if (seconds < 3600) return (seconds/60) + "m " + (seconds%60) + "s";
-        return (seconds/3600) + "h " + ((seconds%3600)/60) + "m";
+    private String fmt(long n)         { return String.format("%,d", n); }
+    private String formatEta(long sec) {
+        if (sec < 60)   return sec + "s";
+        if (sec < 3600) return (sec / 60) + "m " + (sec % 60) + "s";
+        return (sec / 3600) + "h " + ((sec % 3600) / 60) + "m";
     }
 
     @FunctionalInterface private interface Supplier<T> { T get() throws Exception; }
-
     private long safe(Supplier<Long> s) {
         try { Long v = s.get(); return v != null ? v : 0L; } catch (Exception e) { return 0L; }
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    //  PRINT BANNER + SUMMARY
+    //  BANNER + SUMMARY
     // ══════════════════════════════════════════════════════════════════════
 
     private void printBanner(boolean quick, boolean messagesOnly, int totalMessages) {
@@ -900,17 +939,16 @@ public class DataSeeder implements CommandLineRunner {
         log.info("╠══════════════════════════════════════════════════════════╣");
         log.info("║  Mode      : {}", messagesOnly ? "MESSAGES ONLY" : "FULL SEED");
         log.info("║  Scale     : {}", quick ? "QUICK (100k)" : "FULL (1 crore)");
-        log.info("║  Threads   : {} (on 4-core CPU)", NUM_THREADS);
+        log.info("║  Threads   : {}", NUM_THREADS);
         log.info("║  Target    : {}", fmt(totalMessages));
-        log.info("║  DB batch  : {} rows/executeBatch", fmt(DB_BATCH_SIZE));
+        log.info("║  Batch sz  : {} rows -> 1 multi-row INSERT", fmt(DB_BATCH_SIZE));
         log.info("╚══════════════════════════════════════════════════════════╝");
     }
 
     private void printSummary(long globalStart) {
         long elapsed = (System.currentTimeMillis() - globalStart) / 1000;
-        log.info("");
         log.info("╔══════════════════════════════════════════════════════════╗");
-        log.info("║  SEEDER COMPLETE  —  Total time: {} min {} sec", elapsed/60, elapsed%60);
+        log.info("║  SEEDER COMPLETE  —  Total time: {} min {} sec", elapsed / 60, elapsed % 60);
         log.info("╠══════════════════════════════════════════════════════════╣");
         log.info("║  GET /api/chats/inbox?projectId=1&size=20                ║");
         log.info("║  GET /api/v1/get-messages-history?projectId=1            ║");
