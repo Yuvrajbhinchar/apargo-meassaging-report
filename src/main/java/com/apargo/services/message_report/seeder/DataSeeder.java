@@ -121,6 +121,11 @@ public class DataSeeder implements CommandLineRunner {
             "Account","Dispatch"
     };
 
+    // ── FIX: use string ENUM values instead of rng.nextInt(4) ────────────
+    private static final String[] SOURCES = {
+            "MANUAL", "IMPORT", "INTEGRATION", "INBOUND"
+    };
+
     /**
      * Dynamically loaded from DB at startup.
      * Weighted: TEXT appears 3x, TEMPLATE 2x more than others.
@@ -539,6 +544,15 @@ public class DataSeeder implements CommandLineRunner {
     // ══════════════════════════════════════════════════════════════════════
 
     private List<Long> seedContacts() {
+        // ── Skip if contacts already exist for this org ───────────────────
+        Long existing = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM contacts WHERE organization_id=?", Long.class, ORG_ID);
+        if (existing != null && existing > 0) {
+            log.info("━━━ [2/4] Found {} existing contacts — skipping contact seed", fmt(existing));
+            return jdbc.queryForList(
+                    "SELECT id FROM contacts WHERE organization_id=?", Long.class, ORG_ID);
+        }
+
         log.info("━━━ [2/4] Seeding {} contacts...", fmt(NUM_CONTACTS));
         long t0 = System.currentTimeMillis();
 
@@ -556,9 +570,11 @@ public class DataSeeder implements CommandLineRunner {
             String name  = pickFromArray(FIRST_NAMES) + " " + pickFromArray(LAST_NAMES);
             Timestamp ca = daysAgo(180, 730);
 
+            // FIX: use ENUM string values instead of rng.nextInt(4)
             batch.add(new Object[]{
                     ORG_ID, phone, phone.replace("+", ""), name,
-                    rng.nextInt(4), ca, daysAgo(0, 30), ca, ca
+                    pickFromArray(SOURCES),   // ← was: rng.nextInt(4)  (BUG — passed integer 0/1/2/3)
+                    ca, daysAgo(0, 30), ca, ca
             });
 
             if (batch.size() >= DB_BATCH_SIZE) {
@@ -598,6 +614,15 @@ public class DataSeeder implements CommandLineRunner {
         if (contactIds == null || contactIds.isEmpty()) {
             log.error("❌ contactIds is empty — cannot seed conversations.");
             return Collections.emptyList();
+        }
+
+        // ── Skip if conversations already exist for this project ──────────
+        Long existing = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM conversations WHERE project_id=?", Long.class, PROJECT_ID);
+        if (existing != null && existing > 0) {
+            log.info("━━━ [3/4] Found {} existing conversations — skipping conversation seed", fmt(existing));
+            return jdbc.queryForList(
+                    "SELECT id FROM conversations WHERE project_id=?", Long.class, PROJECT_ID);
         }
 
         log.info("━━━ [3/4] Seeding {} conversations...", fmt(NUM_CONVERSATIONS));
