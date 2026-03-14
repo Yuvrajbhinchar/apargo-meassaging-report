@@ -29,7 +29,8 @@ public class Message {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
-    @Column(name = "uuid", nullable = false, unique = true, length = 36)
+    // FIX: DB column is CHAR(36), not VARCHAR(36)
+    @Column(name = "uuid", nullable = false, unique = true, columnDefinition = "CHAR(36)")
     private String uuid;
 
     @Column(name = "organization_id", nullable = false)
@@ -85,10 +86,8 @@ public class Message {
     @Column(name = "payload", columnDefinition = "JSON")
     private String payload;
 
-
     @Column(name = "provider_message_id", length = 150)
     private String providerMessageId;
-
 
     @Enumerated(EnumType.STRING)
     @Column(name = "status",
