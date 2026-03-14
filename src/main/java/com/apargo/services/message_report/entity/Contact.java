@@ -6,16 +6,6 @@ import org.hibernate.annotations.Immutable;
 
 import java.time.LocalDateTime;
 
-/**
- * READ-ONLY mirror of the contacts service table.
- *
- * @Immutable  → Hibernate NEVER issues INSERT / UPDATE / DELETE for this entity.
- *               Any accidental save() call throws immediately.
- *               Also skips dirty-checking → faster flush cycle.
- *
- * No @GeneratedValue → this service never inserts contacts.
- * No @CreationTimestamp / @UpdateTimestamp → those only make sense on owned entities.
- */
 @Getter
 @Immutable
 @Entity
@@ -23,7 +13,6 @@ import java.time.LocalDateTime;
 public class Contact {
 
     @Id
-    // NO @GeneratedValue — we are READING existing contacts, never inserting
     @Column(name = "id")
     private Long id;
 
@@ -39,8 +28,8 @@ public class Contact {
     @Column(name = "display_name", length = 150)
     private String displayName;
 
-    @Enumerated(EnumType.ORDINAL)
-    @Column(name = "source", columnDefinition = "tinyint")
+    @Enumerated(EnumType.STRING)
+    @Column(name = "source")
     private Source source;
 
     @Column(name = "first_seen_at")
