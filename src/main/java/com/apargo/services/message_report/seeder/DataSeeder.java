@@ -16,7 +16,7 @@ import java.util.*;
 
 /**
  * ══════════════════════════════════════════════════════════════════════════════
- *  Production-Scale Data Seeder — 10 lakh (10,000,00) Messages
+ *  Production-Scale Data Seeder — 1 Crore (10,000,000) Messages
  * ══════════════════════════════════════════════════════════════════════════════
  *
  *  HOW TO RUN:
@@ -50,7 +50,7 @@ import java.util.*;
 @RequiredArgsConstructor
 public class DataSeeder implements CommandLineRunner {
 
-    private final JdbcTemplate     jdbc;
+    private final JdbcTemplate      jdbc;
     private final ApplicationContext ctx;
 
     // ══════════════════════════════════════════════════════════════════════
@@ -170,7 +170,19 @@ public class DataSeeder implements CommandLineRunner {
     private void runFullSeed(int totalMessages) {
         seedTemplates();
         List<Long> contactIds = seedContacts();
-        List<Long> convIds    = seedConversations(contactIds);
+
+        if (contactIds.isEmpty()) {
+            log.error("❌ No contacts were seeded. Aborting full seed.");
+            return;
+        }
+
+        List<Long> convIds = seedConversations(contactIds);
+
+        if (convIds.isEmpty()) {
+            log.error("❌ No conversations were seeded. Aborting message seed.");
+            return;
+        }
+
         seedMessagesInChunks(convIds, totalMessages);
     }
 
@@ -191,31 +203,26 @@ public class DataSeeder implements CommandLineRunner {
 
         log.info("  ✓ Found {} existing conversations", convIds.size());
 
-        // Check how many messages already exist so we can inform the user
         Long existing = jdbc.queryForObject(
                 "SELECT COUNT(*) FROM messages WHERE project_id = ?", Long.class, PROJECT_ID
         );
         log.info("  ℹ Existing messages in DB: {}", fmt(existing != null ? existing : 0));
         log.info("  ℹ Will INSERT {} more messages", fmt(totalMessages));
-        log.info("  ℹ Final total will be ≈ {}", fmt((existing != null ? existing : 0) + totalMessages));
+        log.info("  ℹ Final total will be approx {}", fmt((existing != null ? existing : 0) + totalMessages));
 
         seedMessagesInChunks(convIds, totalMessages);
     }
 
     // ══════════════════════════════════════════════════════════════════════
     //  CORE: seed messages in CHUNK_SIZE outer loops
-    //
-    //  Outer loop:  runs totalMessages / CHUNK_SIZE times
-    //               each iteration = CHUNK_SIZE messages
-    //               logs a progress line after each chunk
-    //               backfills last_message_id after each chunk
-    //
-    //  Inner loop:  inside each chunk, inserts DB_BATCH_SIZE rows per
-    //               JDBC batchUpdate call (5,000 rows per SQL)
-    //               also inserts matching message_status_rollup rows
     // ══════════════════════════════════════════════════════════════════════
 
     private void seedMessagesInChunks(List<Long> convIds, int totalMessages) {
+
+        if (convIds == null || convIds.isEmpty()) {
+            log.error("❌ convIds is empty — cannot seed messages.");
+            return;
+        }
 
         log.info("");
         log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -249,7 +256,7 @@ public class DataSeeder implements CommandLineRunner {
             VALUES (?,?,?,?,?,?)
             """;
 
-        int chunksTotal  = (int) Math.ceil((double) totalMessages / CHUNK_SIZE);
+        int chunksTotal   = (int) Math.ceil((double) totalMessages / CHUNK_SIZE);
         int totalInserted = 0;
         Map<Long, Long> globalLastMsg = new HashMap<>();
         long globalStart = System.currentTimeMillis();
@@ -264,38 +271,32 @@ public class DataSeeder implements CommandLineRunner {
             log.info("┌─ Chunk {}/{} — inserting {} messages ─────────────────",
                     chunkNum, chunksTotal, fmt(chunkTarget));
 
-            // ── Insert this chunk in DB_BATCH_SIZE sub-batches ─────────────
             Map<Long, Long> chunkLastMsg = insertChunk(
                     convIds, convContactMap, chunkTarget,
                     msgSql, rollupSql, chunkNum
             );
 
-            // Merge chunk's last-message map into global map
             chunkLastMsg.forEach((convId, msgId) ->
                     globalLastMsg.merge(convId, msgId, (a, b) -> b > a ? b : a)
             );
 
             totalInserted += chunkTarget;
 
-            // ── Backfill last_message_id for this chunk ────────────────────
-            // This ensures conversations.last_message_id is always accurate.
-            // You can test the API mid-run and it will show correct data.
             backfillLastMessageId(chunkLastMsg);
 
-            // ── Chunk progress log ─────────────────────────────────────────
             double chunkSec   = (System.currentTimeMillis() - chunkStart) / 1000.0;
             double totalSec   = (System.currentTimeMillis() - globalStart) / 1000.0;
-            double rowsPerSec = totalInserted / totalSec;
+            double rowsPerSec = totalSec > 0 ? totalInserted / totalSec : 0;
             double remaining  = totalMessages - totalInserted;
-            double etaSec     = remaining / rowsPerSec;
+            double etaSec     = rowsPerSec > 0 ? remaining / rowsPerSec : 0;
             double pct        = (totalInserted * 100.0) / totalMessages;
 
-            log.info("└─ Chunk {}/{} done in {:.1f}s | Total: {}/{} ({:.1f}%) | {:.0f} rows/s | ETA: {}",
+            log.info("└─ Chunk {}/{} done in {}s | Total: {}/{} ({}%) | {} rows/s | ETA: {}",
                     chunkNum, chunksTotal,
-                    chunkSec,
+                    String.format("%.1f", chunkSec),
                     fmt(totalInserted), fmt(totalMessages),
-                    pct,
-                    rowsPerSec,
+                    String.format("%.1f", pct),
+                    String.format("%.0f", rowsPerSec),
                     formatEta((long) etaSec));
         }
 
@@ -305,12 +306,11 @@ public class DataSeeder implements CommandLineRunner {
         log.info("━━━ All {} chunks complete. Total messages inserted: {}",
                 chunksTotal, fmt(totalInserted));
 
-        // Final verification
         verifyInsertedData();
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    //  INSERT ONE CHUNK (CHUNK_SIZE messages split into DB_BATCH_SIZE)
+    //  INSERT ONE CHUNK
     // ══════════════════════════════════════════════════════════════════════
 
     private Map<Long, Long> insertChunk(
@@ -328,50 +328,50 @@ public class DataSeeder implements CommandLineRunner {
         int             inserted       = 0;
 
         for (int i = 0; i < chunkTarget; i++) {
-            long convId    = pick(convIds);
+            long convId    = pickFromList(convIds);
             long contactId = convContactMap.getOrDefault(convId, 1L);
 
-            String    msgType   = pick(MSG_TYPES);
-            String    direction = pick(DIRECTIONS);
-            String    status    = pick(MSG_STATUSES);
-            String    byType    = pick(BY_TYPES);
+            String    msgType   = pickFromArray(MSG_TYPES);
+            String    direction = pickFromArray(DIRECTIONS);
+            String    status    = pickFromArray(MSG_STATUSES);
+            String    byType    = pickFromArray(BY_TYPES);
             Timestamp ca        = randomTimestamp();
 
-            boolean isTmpl    = "TEMPLATE".equals(msgType);
-            boolean isSent    = status.equals("SENT") || status.equals("DELIVERED") || status.equals("READ");
-            boolean isDel     = status.equals("DELIVERED") || status.equals("READ");
-            boolean isRead    = status.equals("READ");
-            boolean isFail    = status.equals("FAILED");
+            boolean isTmpl = "TEMPLATE".equals(msgType);
+            boolean isSent = status.equals("SENT") || status.equals("DELIVERED") || status.equals("READ");
+            boolean isDel  = status.equals("DELIVERED") || status.equals("READ");
+            boolean isRead = status.equals("READ");
+            boolean isFail = status.equals("FAILED");
 
             Timestamp sentAt      = isSent ? plusSeconds(ca, rng.nextInt(30)  + 1)  : null;
             Timestamp deliveredAt = isDel  ? plusSeconds(ca, rng.nextInt(90)  + 30) : null;
             Timestamp readAt      = isRead ? plusSeconds(ca, rng.nextInt(480) + 120): null;
 
             msgBatch.add(new Object[]{
-                    UUID.randomUUID().toString(),        // uuid
-                    ORG_ID,                              // organization_id
-                    PROJECT_ID,                          // project_id
-                    convId,                              // conversation_id
-                    WABA_ID,                             // waba_account_id
-                    contactId,                           // contact_id
-                    direction,                           // direction
-                    msgType,                             // message_type
-                    isTmpl ? pick(TEMPLATE_NAMES) : null,// template_name
-                    isTmpl ? "en" : null,                // template_language
-                    isTmpl ? randomTemplateVars() : null,// template_vars
-                    "TEXT".equals(msgType) ? randSentence() : null, // body_text
-                    "wamid." + shortUuid(),              // provider_message_id
-                    status,                              // status
-                    byType,                              // created_by_type
-                    "USER".equals(byType) ? (long)(rng.nextInt(100) + 1) : null, // created_by_id
-                    ca,                                  // created_at
-                    sentAt,                              // sent_at
-                    deliveredAt,                         // delivered_at
-                    readAt                               // read_at
+                    UUID.randomUUID().toString(),
+                    ORG_ID,
+                    PROJECT_ID,
+                    convId,
+                    WABA_ID,
+                    contactId,
+                    direction,
+                    msgType,
+                    isTmpl ? pickFromArray(TEMPLATE_NAMES) : null,
+                    isTmpl ? "en" : null,
+                    isTmpl ? randomTemplateVars() : null,
+                    "TEXT".equals(msgType) ? randSentence() : null,
+                    "wamid." + shortUuid(),
+                    status,
+                    byType,
+                    "USER".equals(byType) ? (long)(rng.nextInt(100) + 1) : null,
+                    ca,
+                    sentAt,
+                    deliveredAt,
+                    readAt
             });
 
             rollupBatch.add(new Object[]{
-                    0L,                   // placeholder — filled after INSERT
+                    0L,   // placeholder — filled after INSERT
                     isSent ? 1 : 0,
                     isDel  ? 1 : 0,
                     isRead ? 1 : 0,
@@ -379,14 +379,12 @@ public class DataSeeder implements CommandLineRunner {
                     now
             });
 
-            // Flush when DB_BATCH_SIZE reached
             if (msgBatch.size() >= DB_BATCH_SIZE) {
                 int flushed = flushBatch(msgBatch, rollupBatch, msgSql, rollupSql, lastMsgPerConv);
                 inserted += flushed;
                 msgBatch.clear();
                 rollupBatch.clear();
 
-                // Print sub-progress every 10 batches
                 if ((inserted / DB_BATCH_SIZE) % 10 == 0) {
                     log.info("  │  Chunk {} sub-progress: {}/{} messages",
                             chunkNum, fmt(inserted), fmt(chunkTarget));
@@ -394,7 +392,6 @@ public class DataSeeder implements CommandLineRunner {
             }
         }
 
-        // Flush remaining
         if (!msgBatch.isEmpty()) {
             flushBatch(msgBatch, rollupBatch, msgSql, rollupSql, lastMsgPerConv);
         }
@@ -403,7 +400,7 @@ public class DataSeeder implements CommandLineRunner {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    //  FLUSH ONE DB BATCH (msgBatch + rollupBatch)
+    //  FLUSH ONE DB BATCH
     // ══════════════════════════════════════════════════════════════════════
 
     private int flushBatch(
@@ -413,27 +410,23 @@ public class DataSeeder implements CommandLineRunner {
             String          rollupSql,
             Map<Long, Long> lastMsgPerConv
     ) {
-        // 1. Insert messages
         jdbc.batchUpdate(msgSql, msgBatch);
 
-        // 2. Get actual IDs assigned (AUTO_INCREMENT range)
         Long maxId = jdbc.queryForObject("SELECT MAX(id) FROM messages", Long.class);
         if (maxId == null) return 0;
 
         long firstId = maxId - msgBatch.size() + 1;
 
-        // 3. Build rollup rows with real message IDs
         List<Object[]> actualRollup = new ArrayList<>(msgBatch.size());
         for (int j = 0; j < msgBatch.size(); j++) {
             long mid    = firstId + j;
-            long convId = (long) msgBatch.get(j)[3];   // conversation_id is index 3
+            long convId = (long) msgBatch.get(j)[3];   // conversation_id is at index 3
             Object[] r  = rollupBatch.get(j);
 
             lastMsgPerConv.merge(convId, mid, (a, b) -> b > a ? b : a);
             actualRollup.add(new Object[]{ mid, r[1], r[2], r[3], r[4], r[5] });
         }
 
-        // 4. Insert rollup
         jdbc.batchUpdate(rollupSql, actualRollup);
 
         return msgBatch.size();
@@ -441,7 +434,6 @@ public class DataSeeder implements CommandLineRunner {
 
     // ══════════════════════════════════════════════════════════════════════
     //  BACKFILL last_message_id on conversations
-    //  Called after every chunk so the API stays accurate mid-run
     // ══════════════════════════════════════════════════════════════════════
 
     private void backfillLastMessageId(Map<Long, Long> lastMsgPerConv) {
@@ -561,7 +553,7 @@ public class DataSeeder implements CommandLineRunner {
 
         for (int i = 0; i < NUM_CONTACTS; i++) {
             String phone = "+91" + (7000000000L + (long)(rng.nextDouble() * 2999999999L));
-            String name  = pick(FIRST_NAMES) + " " + pick(LAST_NAMES);
+            String name  = pickFromArray(FIRST_NAMES) + " " + pickFromArray(LAST_NAMES);
             Timestamp ca = daysAgo(180, 730);
 
             batch.add(new Object[]{
@@ -576,10 +568,23 @@ public class DataSeeder implements CommandLineRunner {
         }
         if (!batch.isEmpty()) jdbc.batchUpdate(sql, batch);
 
+        // Verify how many contacts landed in DB
+        Long dbCount = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM contacts WHERE organization_id=?", Long.class, ORG_ID);
+        log.info("  ✓ DB reports {} contacts for org_id={}", fmt(dbCount != null ? dbCount : 0L), ORG_ID);
+
         List<Long> ids = jdbc.queryForList(
                 "SELECT id FROM contacts WHERE organization_id=?", Long.class, ORG_ID);
-        log.info("  ✓ {} contacts ready ({:.1f}s)",
-                fmt(ids.size()), (System.currentTimeMillis() - t0) / 1000.0);
+
+        double elapsed = (System.currentTimeMillis() - t0) / 1000.0;
+        log.info("  ✓ {} contacts ready ({} s)", fmt(ids.size()), String.format("%.1f", elapsed));
+
+        if (ids.isEmpty()) {
+            log.error("  ❌ contacts list is empty after seed! " +
+                    "Check: (1) INSERT IGNORE may have skipped all rows due to unique constraint, " +
+                    "(2) organization_id mismatch. Run: SELECT COUNT(*) FROM contacts;");
+        }
+
         return ids;
     }
 
@@ -588,6 +593,13 @@ public class DataSeeder implements CommandLineRunner {
     // ══════════════════════════════════════════════════════════════════════
 
     private List<Long> seedConversations(List<Long> contactIds) {
+
+        // ── Guard: never call rng.nextInt(0) ─────────────────────────────
+        if (contactIds == null || contactIds.isEmpty()) {
+            log.error("❌ contactIds is empty — cannot seed conversations.");
+            return Collections.emptyList();
+        }
+
         log.info("━━━ [3/4] Seeding {} conversations...", fmt(NUM_CONVERSATIONS));
         long t0 = System.currentTimeMillis();
 
@@ -605,12 +617,12 @@ public class DataSeeder implements CommandLineRunner {
         List<Object[]> batch = new ArrayList<>(DB_BATCH_SIZE);
 
         for (int i = 0; i < NUM_CONVERSATIONS; i++) {
-            long      contactId  = pick(contactIds);
-            String    status     = pick(STATUSES);
-            String    assignType = pick(ASSIGNED_TYPES);
+            long      contactId  = pickFromList(contactIds);
+            String    status     = pickFromArray(STATUSES);
+            String    assignType = pickFromArray(ASSIGNED_TYPES);
             Long      assignId   = "UNASSIGNED".equals(assignType) ? null : (long)(rng.nextInt(50) + 1);
             Timestamp lastMsg    = daysAgo(0, 180);
-            String    direction  = pick(DIRECTIONS);
+            String    direction  = pickFromArray(DIRECTIONS);
             int       unread     = "OPEN".equals(status) ? rng.nextInt(25) : 0;
             Timestamp openUntil  = "INBOUND".equals(direction)
                     ? Timestamp.from(lastMsg.toInstant().plus(24, ChronoUnit.HOURS)) : null;
@@ -636,16 +648,20 @@ public class DataSeeder implements CommandLineRunner {
 
         List<Long> ids = jdbc.queryForList(
                 "SELECT id FROM conversations WHERE project_id=?", Long.class, PROJECT_ID);
-        log.info("  ✓ {} conversations ready ({:.1f}s)",
-                fmt(ids.size()), (System.currentTimeMillis() - t0) / 1000.0);
+
+        double elapsed = (System.currentTimeMillis() - t0) / 1000.0;
+        log.info("  ✓ {} conversations ready ({} s)", fmt(ids.size()), String.format("%.1f", elapsed));
+
+        if (ids.isEmpty()) {
+            log.error("  ❌ conversations list is empty after seed! " +
+                    "Check for INSERT IGNORE silently skipping all rows.");
+        }
+
         return ids;
     }
 
     // ══════════════════════════════════════════════════════════════════════
     //  DETECT VALID ENUM VALUES FROM DB
-    //
-    //  Avoids "Data truncated for column 'message_type'" errors when the
-    //  DB ENUM is a subset of what the Java enum declares.
     // ══════════════════════════════════════════════════════════════════════
 
     private void initEnumValues() {
@@ -692,8 +708,7 @@ public class DataSeeder implements CommandLineRunner {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    //  VERIFICATION — runs after all chunks complete
-    //  Prints counts so you can confirm data before testing the API
+    //  VERIFICATION
     // ══════════════════════════════════════════════════════════════════════
 
     private void verifyInsertedData() {
@@ -701,27 +716,16 @@ public class DataSeeder implements CommandLineRunner {
         log.info("━━━ POST-SEED VERIFICATION ─────────────────────────────────");
 
         try {
-            long contacts  = safe(() -> jdbc.queryForObject(
-                    "SELECT COUNT(*) FROM contacts", Long.class));
-            long convs     = safe(() -> jdbc.queryForObject(
-                    "SELECT COUNT(*) FROM conversations", Long.class));
-            long msgs      = safe(() -> jdbc.queryForObject(
-                    "SELECT COUNT(*) FROM messages", Long.class));
-            long rollup    = safe(() -> jdbc.queryForObject(
-                    "SELECT COUNT(*) FROM message_status_rollup", Long.class));
-            long templates = safe(() -> jdbc.queryForObject(
-                    "SELECT COUNT(*) FROM whatsapp_templates", Long.class));
-            long openConvs = safe(() -> jdbc.queryForObject(
-                    "SELECT COUNT(*) FROM conversations WHERE status='OPEN'", Long.class));
-            long unread    = safe(() -> jdbc.queryForObject(
-                    "SELECT COALESCE(SUM(unread_count),0) FROM conversations WHERE status='OPEN'",
-                    Long.class));
-            long withLastMsg = safe(() -> jdbc.queryForObject(
-                    "SELECT COUNT(*) FROM conversations WHERE last_message_id IS NOT NULL", Long.class));
-            long templateMsgs = safe(() -> jdbc.queryForObject(
-                    "SELECT COUNT(*) FROM messages WHERE message_type='TEMPLATE'", Long.class));
-            long textMsgs = safe(() -> jdbc.queryForObject(
-                    "SELECT COUNT(*) FROM messages WHERE message_type='TEXT'", Long.class));
+            long contacts    = safe(() -> jdbc.queryForObject("SELECT COUNT(*) FROM contacts", Long.class));
+            long convs       = safe(() -> jdbc.queryForObject("SELECT COUNT(*) FROM conversations", Long.class));
+            long msgs        = safe(() -> jdbc.queryForObject("SELECT COUNT(*) FROM messages", Long.class));
+            long rollup      = safe(() -> jdbc.queryForObject("SELECT COUNT(*) FROM message_status_rollup", Long.class));
+            long templates   = safe(() -> jdbc.queryForObject("SELECT COUNT(*) FROM whatsapp_templates", Long.class));
+            long openConvs   = safe(() -> jdbc.queryForObject("SELECT COUNT(*) FROM conversations WHERE status='OPEN'", Long.class));
+            long unread      = safe(() -> jdbc.queryForObject("SELECT COALESCE(SUM(unread_count),0) FROM conversations WHERE status='OPEN'", Long.class));
+            long withLastMsg = safe(() -> jdbc.queryForObject("SELECT COUNT(*) FROM conversations WHERE last_message_id IS NOT NULL", Long.class));
+            long templateMsgs = safe(() -> jdbc.queryForObject("SELECT COUNT(*) FROM messages WHERE message_type='TEMPLATE'", Long.class));
+            long textMsgs    = safe(() -> jdbc.queryForObject("SELECT COUNT(*) FROM messages WHERE message_type='TEXT'", Long.class));
 
             log.info("  contacts              : {}", fmt(contacts));
             log.info("  conversations (total) : {}", fmt(convs));
@@ -735,7 +739,7 @@ public class DataSeeder implements CommandLineRunner {
             log.info("  whatsapp_templates    : {}", fmt(templates));
 
             if (msgs != rollup) {
-                log.warn("  ⚠ messages ({}) ≠ rollup ({}) — some rollup rows may be missing",
+                log.warn("  ⚠ messages ({}) != rollup ({}) — some rollup rows may be missing",
                         fmt(msgs), fmt(rollup));
             } else {
                 log.info("  ✓ messages == rollup — counts match perfectly");
@@ -756,7 +760,7 @@ public class DataSeeder implements CommandLineRunner {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    //  MYSQL BULK MODE — disables FK/unique checks during mass insert
+    //  MYSQL BULK MODE
     // ══════════════════════════════════════════════════════════════════════
 
     private void setMysqlBulkMode(boolean on) {
@@ -792,17 +796,16 @@ public class DataSeeder implements CommandLineRunner {
     // ══════════════════════════════════════════════════════════════════════
 
     private Timestamp daysAgo(int minDays, int maxDays) {
-        long ms = ((long)(rng.nextInt((maxDays - minDays + 1) * 86400)) + (long)(minDays * 86400L)) * 1000L;
+        if (maxDays <= minDays) maxDays = minDays + 1;
+        long ms = ((long)(rng.nextInt((maxDays - minDays) * 86400)) + (long)(minDays * 86400L)) * 1000L;
         return Timestamp.from(Instant.now().minusMillis(ms));
     }
 
     /**
      * Returns a random timestamp spread over the last 365 days.
-     * Uses a slightly biased distribution so recent messages are more common
-     * (simulates real chat data: more messages recently).
+     * 70% of messages in last 90 days, 30% in 90–365 days.
      */
     private Timestamp randomTimestamp() {
-        // 70% of messages in last 90 days, 30% in last 90-365 days
         int maxDays = rng.nextInt(100) < 70 ? 90 : 365;
         return daysAgo(0, maxDays);
     }
@@ -811,11 +814,27 @@ public class DataSeeder implements CommandLineRunner {
         return Timestamp.from(base.toInstant().plusSeconds(seconds));
     }
 
-    private <T> T pick(T[] arr) {
+    /**
+     * Pick a random element from a String array.
+     * Never throws for non-empty arrays.
+     */
+    private String pickFromArray(String[] arr) {
+        if (arr == null || arr.length == 0) {
+            throw new IllegalStateException("Cannot pick from an empty array");
+        }
         return arr[rng.nextInt(arr.length)];
     }
 
-    private long pick(List<Long> list) {
+    /**
+     * Pick a random Long from a list.
+     * Guards against empty list — throws a clear error instead of
+     * the cryptic "bound must be positive" from rng.nextInt(0).
+     */
+    private long pickFromList(List<Long> list) {
+        if (list == null || list.isEmpty()) {
+            throw new IllegalStateException(
+                    "Cannot pick from an empty list. Make sure contacts/conversations were seeded first.");
+        }
         return list.get(rng.nextInt(list.size()));
     }
 
@@ -824,7 +843,7 @@ public class DataSeeder implements CommandLineRunner {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < len; i++) {
             if (i > 0) sb.append(' ');
-            sb.append(pick(WORDS));
+            sb.append(pickFromArray(WORDS));
         }
         return sb.toString();
     }
@@ -833,24 +852,20 @@ public class DataSeeder implements CommandLineRunner {
         return UUID.randomUUID().toString().replace("-", "").substring(0, 24);
     }
 
-    /**
-     * Returns a realistic templateVars JSON with random variable values.
-     * Matches the structure expected by TemplateDetailResponse.from()
-     */
     private String randomTemplateVars() {
         String[] names   = {"John","Priya","Rahul","Meena","Amit","Sunita","Raj","Kavita"};
         String[] orders  = {"ORD-1234","ORD-5678","ORD-9012","ORD-3456","INV-7890"};
         String[] dates   = {"Tomorrow","Today","In 2 days","This Friday","Monday"};
-        String[] amounts = {"₹500","₹1200","₹2500","₹499","₹999"};
+        String[] amounts = {"INR500","INR1200","INR2500","INR499","INR999"};
 
         int variant = rng.nextInt(4);
         return switch (variant) {
             case 0 -> String.format("{\"body\":[[\"'%s'\",\"%s\",\"%s\"]]}",
-                    pick(names), pick(orders), pick(dates));
+                    pickFromArray(names), pickFromArray(orders), pickFromArray(dates));
             case 1 -> String.format("{\"body\":[[\"'%s'\",\"%s\"]]}",
-                    pick(names), pick(amounts));
+                    pickFromArray(names), pickFromArray(amounts));
             case 2 -> String.format("{\"body\":[[\"'%s'\"]]}",
-                    pick(names));
+                    pickFromArray(names));
             default -> "{\"body\":[[\"Customer\",\"ORD-0000\",\"Soon\"]]}";
         };
     }
@@ -860,7 +875,7 @@ public class DataSeeder implements CommandLineRunner {
     }
 
     private String formatEta(long seconds) {
-        if (seconds < 60)  return seconds + "s";
+        if (seconds < 60)   return seconds + "s";
         if (seconds < 3600) return (seconds / 60) + "m " + (seconds % 60) + "s";
         return (seconds / 3600) + "h " + ((seconds % 3600) / 60) + "m";
     }
@@ -883,7 +898,7 @@ public class DataSeeder implements CommandLineRunner {
         log.info("╠══════════════════════════════════════════════════════════╣");
         log.info("║  Mode         : {}",
                 messagesOnly ? "MESSAGES ONLY (reuse existing convs)" : "FULL SEED (contacts+convs+msgs)");
-        log.info("║  Scale        : {}", quick ? "QUICK" : "FULL (1 crore)");
+        log.info("║  Scale        : {}", quick ? "QUICK (100k)" : "FULL (1 crore)");
         log.info("║  Target msgs  : {}", fmt(totalMessages));
         log.info("║  Chunk size   : {} (outer loop)", fmt(CHUNK_SIZE));
         log.info("║  DB batch     : {} (rows per INSERT)", fmt(DB_BATCH_SIZE));
@@ -895,7 +910,7 @@ public class DataSeeder implements CommandLineRunner {
         long elapsed = (System.currentTimeMillis() - globalStart) / 1000;
         log.info("");
         log.info("╔══════════════════════════════════════════════════════════╗");
-        log.info("║  ✅ SEEDER COMPLETE                                       ║");
+        log.info("║  SEEDER COMPLETE                                          ║");
         log.info("║  Total time: {} min {} sec", elapsed / 60, elapsed % 60);
         log.info("╠══════════════════════════════════════════════════════════╣");
         log.info("║  Test your APIs:                                          ║");
